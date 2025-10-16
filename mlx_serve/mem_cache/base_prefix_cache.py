@@ -2,11 +2,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, NamedTuple, Tuple
 
 import mlx.core as mx
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
-else:
-    Req = Any  # Placeholder for Req type when not type checking
+Req = Any
 
 
 class MatchResult(NamedTuple):

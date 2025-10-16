@@ -330,9 +330,6 @@ class RadixCache(BasePrefixCache):
         child.value = child.value[split_len:]
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
-        self._record_store_event(new_node)
-        self._record_store_event(child)
-
         return new_node
 
     def _insert_helper(self, node: TreeNode, key: List, value):
@@ -365,7 +362,6 @@ class RadixCache(BasePrefixCache):
             new_node.value = value
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
-            self._record_store_event(new_node)
         return total_prefix_length
 
     def _print_helper(self, node: TreeNode, indent: int):

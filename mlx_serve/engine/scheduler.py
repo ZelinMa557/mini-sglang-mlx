@@ -16,10 +16,5 @@ class Scheduler:
         self.request_pool = request_pool
         pass
 
-    def next_batch(self) -> tuple[ForwardBatch, ForwardBatch]:
-        gpu_batch: ForwardBatch = ForwardBatch()
-        cpu_batch: ForwardBatch = ForwardBatch()
-
-        running_tokens: int = 0
-        # try prefill first
+    def next_batch(self) -> ForwardBatch:
         

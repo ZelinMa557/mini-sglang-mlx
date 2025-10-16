@@ -188,10 +188,6 @@ class MHATokenToKVPool(KVCache):
             for _ in range(self.layer_num)
         ]
 
-        self.data_ptrs = mx.tensor(
-            [x.data_ptr() for x in self.k_buffer + self.v_buffer],
-            dtype=mx.uint64,
-        )
         self.data_strides = mx.tensor(
             [
                 np.prod(x.shape[1:]) * x.dtype.itemsize
@@ -214,64 +210,12 @@ class MHATokenToKVPool(KVCache):
             v_size_bytes += np.prod(v_cache.shape) * v_cache.dtype.itemsize
         return k_size_bytes, v_size_bytes
 
-    # for disagg
-    def get_contiguous_buf_infos(self):
-        # layer_num x [seq_len, head_num, head_dim]
-        # layer_num x [page_num, page_size, head_num, head_dim]
-        kv_data_ptrs = [
-            self.get_key_buffer(i).data_ptr()
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ] + [
-            self.get_value_buffer(i).data_ptr()
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ]
-        kv_data_lens = [
-            self.get_key_buffer(i).nbytes
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ] + [
-            self.get_value_buffer(i).nbytes
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ]
-        kv_item_lens = [
-            self.get_key_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ] + [
-            self.get_value_buffer(i)[0].nbytes * self.page_size
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ]
-        return kv_data_ptrs, kv_data_lens, kv_item_lens
-
-
-    # Todo: different memory layout
-    def get_flat_data(self, indices):
-        # prepare a large chunk of contiguous data for efficient transfer
-        flatten = mx.stack(
-            [
-                mx.stack([self.k_buffer[i][indices] for i in range(self.layer_num)]),
-                mx.stack([self.v_buffer[i][indices] for i in range(self.layer_num)]),
-            ]
-        )
-        return flatten
-
-    def transfer_per_layer(self, indices, flat_data, layer_id):
-        # transfer prepared data from host to device
-        flat_data = flat_data.to(device=self.device, non_blocking=False)
-        k_data, v_data = flat_data[0], flat_data[1]
-        self.k_buffer[layer_id - self.start_layer][indices] = k_data
-        self.v_buffer[layer_id - self.start_layer][indices] = v_data
-
     def get_key_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-
         if self.store_dtype != self.dtype:
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.k_buffer[layer_id - self.start_layer]
 
     def get_value_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-
         if self.store_dtype != self.dtype:
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.v_buffer[layer_id - self.start_layer]
