@@ -2,8 +2,8 @@
 #include <metal_stdlib>
 #include "mlx/backend/metal/kernels/utils.h"
 
-template <typename T, int HEAD_SIZE, int N_GQA, int VEC_SIZE = 8, int SLIDING_WINDOW = -1>
-[[kernel]] void paged_group_query_attention(
+template <typename T, int HEAD_DIM, int N_GQA, int VEC_SIZE = 8, int SLIDING_WINDOW = -1>
+[[kernel]] void paged_prefill_group_query_attention(
     const device T* query, // NHD layout
     const device int* position_ids,
     const device int* seq_ids,
@@ -37,7 +37,7 @@ template <typename T, int HEAD_SIZE, int N_GQA, int VEC_SIZE = 8, int SLIDING_WI
     Vector_FP32 O_buffer[N_GQA][VEC_PER_HEAD];
     for (uint i = 0; i < N_GQA; i++) {
         for (uint d_vec = 0; d_vec < VEC_PER_HEAD; d_vec++) {
-            query_vec_v[d_vec] = ((device vec<T, 8>*) (queries + q_base))[d_vec];
+            query_vec_v[d_vec] = ((device vec<T, 8>*) (query_ptr))[d_vec];
         }
     }
 
@@ -81,12 +81,11 @@ template <typename T, int HEAD_SIZE, int N_GQA, int VEC_SIZE = 8, int SLIDING_WI
             const float m_old = max_scores[i];
             const float m_new = max(max_scores[i], scores[i] * scale_val);
             const float exp_diff = exp(m_old - m_new);
-            const float exp_diff2 = exp(max_scores[i] - m_new);
-            log_sum_exps[i] = log_sum_exps[i] * exp_diff + exp_diff2;
+            log_sum_exps[i] = log_sum_exps[i] * exp_diff + exp_diff;
 
             max_scores[i] = m_new;
             for (int d_vec = 0; d_vec < VEC_PER_HEAD; d_vec++) {
-                O_buffer[i][d_vec] = O_buffer[i][d_vec] * exp_diff + exp_diff2 * v_buffer[d_vec];
+                O_buffer[i][d_vec] = O_buffer[i][d_vec] * exp_diff + exp_diff * v_buffer[d_vec];
             }
         }
     }
