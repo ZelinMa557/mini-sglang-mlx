@@ -17,6 +17,9 @@ class ForwardBatch:
     position_ids: mx.array = None
     last_positions: mx.array = None
     forward_type: ForwardType = ForwardType.none
+    temperatures: mx.array = None
+    top_ks: mx.array = None
+    top_ps: mx.array = None
 
 
     def _init_position_ids(self):
