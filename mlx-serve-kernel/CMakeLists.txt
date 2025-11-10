@@ -33,7 +33,8 @@ add_library(mlx_serve_kernel)
 
 # Add sources
 target_sources(mlx_serve_kernel PUBLIC ${CMAKE_CURRENT_LIST_DIR}/csrc/varlen_rope.hpp
-                                       ${CMAKE_CURRENT_LIST_DIR}/csrc/fused_add_rmsnorm.cpp)
+                                       ${CMAKE_CURRENT_LIST_DIR}/csrc/fused_add_rmsnorm.cpp
+                                       ${CMAKE_CURRENT_LIST_DIR}/csrc/moe_sum_reduce.cpp)
 
 # Add include headers
 target_include_directories(mlx_serve_kernel PUBLIC ${CMAKE_CURRENT_LIST_DIR}/csrc)
@@ -53,6 +54,7 @@ if(MLX_BUILD_METAL)
     SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/csrc/varlen_rope.metal
     ${CMAKE_CURRENT_LIST_DIR}/csrc/fused_add_rmsnorm.metal
+    ${CMAKE_CURRENT_LIST_DIR}/csrc/moe_sum_reduce.metal
     INCLUDE_DIRS
     ${PROJECT_SOURCE_DIR}
     ${MLX_INCLUDE_DIRS}

@@ -3,7 +3,7 @@
 #include "mlx/backend/metal/kernels/utils.h"
 
 template <typename T, int HEAD_DIM, int N_GQA, int VEC_SIZE = 8, int SLIDING_WINDOW = -1>
-[[kernel]] void paged_prefill_group_query_attention(
+[[kernel]] void paged_prefill_attention(
     const device T* query, // NHD layout
     const device int* position_ids,
     const device int* seq_ids,
@@ -14,6 +14,8 @@ template <typename T, int HEAD_DIM, int N_GQA, int VEC_SIZE = 8, int SLIDING_WIN
     constant const float &scale_val,
     constant const size_t &num_heads,
     constant const size_t &num_kv_heads,
+    constant const size_t &query_stride[2],
+    constant const size_t &output_stride[2],
     constant const size_t &kv_indices_stride,
     constant const size_t input_output_stride[2],
     constant const size_t kv_cache_stride[2], // NHD layout
@@ -97,3 +99,6 @@ template <typename T, int HEAD_DIM, int N_GQA, int VEC_SIZE = 8, int SLIDING_WIN
         }
     }
 }
+
+instantiate_kernel(paged_prefill_attention_bfloat16, bfloat16_t, 128, 8);
+instantiate_kernel(paged_prefill_attention_float16, half, 128, 8);
