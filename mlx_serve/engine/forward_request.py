@@ -1,9 +1,19 @@
 from dataclasses import dataclass
+from enum import Enum, auto
+class ForwardRequestStatus(Enum):
+    WAITING = auto()
+    RUNNING = auto()
+    FINISHED = auto()
 
 @dataclass
 class ForwardRequest:
+    id: int
     input_tokens: list[int] = None
     generated_tokens: list[int] = None
+    temperature: float = None
+    top_k: int = None
+    top_p: float = None
+    status: ForwardRequestStatus = ForwardRequestStatus.WAITING
 
 class ForwardRequestPool:
     def __init__(self, size: int):

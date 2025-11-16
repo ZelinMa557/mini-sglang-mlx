@@ -86,16 +86,12 @@ class KVCache(abc.ABC):
         page_size: int,
         dtype: mx.Dtype,
         layer_num: int,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
     ):
         self.size = size
         self.page_size = page_size
         self.dtype = dtype
         self.store_dtype = dtype
         self.layer_num = layer_num
-        self.start_layer = start_layer or 0
-        self.end_layer = end_layer or layer_num - 1
 
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> mx.array:
@@ -144,8 +140,6 @@ class MHATokenToKVPool(KVCache):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
     ):
         super().__init__(
             size,
@@ -154,8 +148,6 @@ class MHATokenToKVPool(KVCache):
             layer_num,
             device,
             enable_memory_saver,
-            start_layer,
-            end_layer,
         )
 
         self.head_num = head_num
@@ -212,13 +204,13 @@ class MHATokenToKVPool(KVCache):
 
     def get_key_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.k_buffer[layer_id - self.start_layer]
+            return self.k_buffer[layer_id].view(self.dtype)
+        return self.k_buffer[layer_id]
 
     def get_value_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
-        return self.v_buffer[layer_id - self.start_layer]
+            return self.v_buffer[layer_id].view(self.dtype)
+        return self.v_buffer[layer_id]
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
@@ -245,5 +237,5 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-        self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+        self.k_buffer[layer_id][loc] = cache_k
+        self.v_buffer[layer_id][loc] = cache_v

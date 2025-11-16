@@ -89,3 +89,34 @@ class Qwen3Model(nn.Module):
             hidden_states, residual = layer(hidden_states, residual, forward_batch)
 
         return self.norm(hidden_states, residual)
+
+class Qwen3ForCausalLM(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.model_type = args.model_type
+        self.model = Qwen3Model(args)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache=None,
+        input_embeddings: Optional[mx.array] = None,
+    ):
+        out = self.model(inputs, cache, input_embeddings)
+        if self.args.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
+        return out
+
+    def sanitize(self, weights):
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+        return weights
+
+    @property
+    def layers(self):
+        return self.model.layers
