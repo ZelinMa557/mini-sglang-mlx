@@ -9,8 +9,12 @@ class LogitsProcessor(nn.Module):
         super().__init__()
 
     
-    def __call__(self, hidden_states: mx.array, lm_head: nn.Linear, forward_batch: ForwardBatch) -> mx.array:
+    def __call__(self, hidden_states: mx.array, forward_batch: ForwardBatch, model, tie_word_embeddings: bool) -> mx.array:
         hidden_states = hidden_states[forward_batch.last_positions, :]
-        logits = lm_head(hidden_states)
+
+        if tie_word_embeddings:
+            logits = model.model.embed_tokens.as_linear(hidden_states)
+        else:
+            logits = model.lm_head(hidden_states)
         logprobs = logits - mx.logsumexp(logits, keepdims=True)
         return logprobs

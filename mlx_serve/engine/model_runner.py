@@ -1,190 +1,171 @@
-# Adapted from https://github.com/GeeeekExplorer/nano-vllm/blob/main/nanovllm/engine/model_runner.py
-import pickle
-import torch
-import torch.distributed as dist
-from multiprocessing.synchronize import Event
-from multiprocessing.shared_memory import SharedMemory
-
-from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
-from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
-from nanovllm.utils.loader import load_model
+import mlx.core as mx
+import mlx.nn as nn
+from typing import List, Optional
+from mlx_serve.models.qwen3 import Qwen3ForCausalLM, ModelArgs
+from mlx_serve.layers.logits_processor import LogitsProcessor
+from mlx_serve.layers.sampler import TopKTopPSampler
+from mlx_serve.engine.forward_batch import ForwardBatch, ForwardType
+from mlx_serve.engine.forward_request import ForwardRequest
+from mlx_serve.mem_cache.memory_pool import ReqToTokenPool, MHATokenToKVPool
+from mlx_serve.mem_cache.allocator import TokenToKVPoolAllocator
+from mlx_serve.mem_cache.radix_cache import RadixCache
 
 
 class ModelRunner:
-
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
-        self.config = config
-        hf_config = config.hf_config
-
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
-        self.sampler = Sampler()
+    def __init__(
+        self,
+        model: Qwen3ForCausalLM,
+        model_args: ModelArgs,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        radix_cache: RadixCache,
+        max_num_batched_tokens: int,
+        max_model_len: int,
+    ):
+        self.model = model
+        self.model_args = model_args
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.radix_cache = radix_cache
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.max_model_len = max_model_len
+        self.logits_processor = LogitsProcessor()
+        self.sampler = TopKTopPSampler()
+        
+        # Warmup model
         self.warmup_model()
-        self.allocate_kv_cache()
-
-    def exit(self):
-        if self.world_size > 1:
-            self.shm.close()
-            dist.barrier()
-            if self.rank == 0:
-                self.shm.unlink()
-        if not self.enforce_eager:
-            del self.graphs, self.graph_pool
-        torch.cuda.synchronize()
-        dist.destroy_process_group()
-
-    def loop(self):
-        while True:
-            method_name, args = self.read_shm()
-            self.call(method_name, *args)
-            if method_name == "exit":
-                break
-
-    def read_shm(self):
-        assert self.world_size > 1 and self.rank > 0
-        self.event.wait()
-        n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-        self.event.clear()
-        return method_name, args
-
-    def write_shm(self, method_name, *args):
-        assert self.world_size > 1 and self.rank == 0
-        data = pickle.dumps([method_name, *args])
-        n = len(data)
-        self.shm.buf[0:4] = n.to_bytes(4, "little")
-        self.shm.buf[4:n+4] = data
-        for event in self.event:
-            event.set()
-
-    def call(self, method_name, *args):
-        method = getattr(self, method_name, None)
-        return method(*args)
 
     def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
-        self.run(seqs, True)
-        torch.cuda.empty_cache()
+        """Warmup the model with dummy inputs."""
+        input_ids = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        forward_batch = ForwardBatch(
+            request_ids=[0],
+            seq_lens=[5],
+            offsets=[0],
+            forward_type=ForwardType.prefill,
+            temperatures=[1.0],
+        )
+        self.model(input_ids, forward_batch)
 
-    def allocate_kv_cache(self):
-        config = self.config
-        hf_config = config.hf_config
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
-
-    def prepare_block_tables(self, seqs: list[Sequence]):
-        max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        return block_tables
-
-    def prepare_prefill(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
-        cu_seqlens_q = [0]
-        cu_seqlens_k = [0]
-        max_seqlen_q = 0
-        max_seqlen_k = 0
-        slot_mapping = []
-        block_tables = None
-        for seq in seqs:
-            seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-            seqlen_q = seqlen - seq.num_cached_tokens
-            seqlen_k = seqlen
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-            max_seqlen_q = max(seqlen_q, max_seqlen_q)
-            max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:    # warmup
-                continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
-                else:
-                    end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
-        return input_ids, positions
-
-    def prepare_decode(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
-        slot_mapping = []
-        context_lens = []
-        for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
-        return input_ids, positions
-
-    def prepare_sample(self, seqs: list[Sequence]):
+    def prepare_prefill_batch(
+        self,
+        requests: List[ForwardRequest],
+        prefix_indices_list: List[mx.array],
+    ) -> ForwardBatch:
+        """Prepare a batch for prefill phase."""
+        input_ids_list = []
+        seq_lens = []
+        offsets = []
+        request_ids = []
         temperatures = []
-        for seq in seqs:
-            temperatures.append(seq.temperature)
-        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        return temperatures
+        top_ks = []
+        top_ps = []
+        current_offset = 0
+        
+        for req, prefix_indices in zip(requests, prefix_indices_list):
+            # Get all tokens (input + generated so far)
+            all_tokens = (req.input_tokens or []) + (req.generated_tokens or [])
+            
+            # Calculate how many tokens need to be processed
+            # prefix_indices contains the matched prefix from radix cache
+            prefix_len = len(prefix_indices) if prefix_indices is not None else 0
+            tokens_to_process = all_tokens[prefix_len:]
+            
+            if len(tokens_to_process) == 0:
+                continue
+                
+            input_ids_list.extend(tokens_to_process)
+            seq_len = len(tokens_to_process)
+            seq_lens.append(seq_len)
+            offsets.append(current_offset)
+            current_offset += seq_len
+            request_ids.append(req.id)
+            temperatures.append(req.temperature if req.temperature is not None else 1.0)
+            top_ks.append(req.top_k if req.top_k is not None else -1)
+            top_ps.append(req.top_p if req.top_p is not None else 1.0)
+        
+        if len(input_ids_list) == 0:
+            return None
+            
+        input_ids = mx.array(input_ids_list, dtype=mx.int32)
+        batch = ForwardBatch(
+            request_ids=request_ids,
+            seq_lens=mx.array(seq_lens, dtype=mx.int32),
+            offsets=mx.array(offsets, dtype=mx.int32),
+            forward_type=ForwardType.prefill,
+            temperatures=mx.array(temperatures, dtype=mx.float32),
+            top_ks=mx.array(top_ks, dtype=mx.int32),
+            top_ps=mx.array(top_ps, dtype=mx.float32),
+        )
+        batch._init_position_ids()
+        return batch, input_ids
 
-    @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+    def prepare_decode_batch(
+        self,
+        requests: List[ForwardRequest],
+    ) -> tuple[ForwardBatch, mx.array]:
+        """Prepare a batch for decode phase."""
+        input_ids_list = []
+        seq_lens = []
+        offsets = []
+        request_ids = []
+        temperatures = []
+        top_ks = []
+        top_ps = []
+        current_offset = 0
+        
+        for req in requests:
+            # For decode, we only process the last token
+            all_tokens = (req.input_tokens or []) + (req.generated_tokens or [])
+            if len(all_tokens) == 0:
+                continue
+                
+            last_token = all_tokens[-1]
+            input_ids_list.append(last_token)
+            seq_lens.append(1)
+            offsets.append(current_offset)
+            current_offset += 1
+            request_ids.append(req.id)
+            temperatures.append(req.temperature if req.temperature is not None else 1.0)
+            top_ks.append(req.top_k if req.top_k is not None else -1)
+            top_ps.append(req.top_p if req.top_p is not None else 1.0)
+        
+        if len(input_ids_list) == 0:
+            return None, None
+            
+        input_ids = mx.array(input_ids_list, dtype=mx.int32)
+        batch = ForwardBatch(
+            request_ids=request_ids,
+            seq_lens=mx.array(seq_lens, dtype=mx.int32),
+            offsets=mx.array(offsets, dtype=mx.int32),
+            forward_type=ForwardType.decode,
+            temperatures=mx.array(temperatures, dtype=mx.float32),
+            top_ks=mx.array(top_ks, dtype=mx.int32),
+            top_ps=mx.array(top_ps, dtype=mx.float32),
+        )
+        return batch, input_ids
+
+    def run(
+        self,
+        requests: List[ForwardRequest],
+        prefix_indices_list: List[Optional[mx.array]],
+        is_prefill: bool,
+    ) -> mx.array:
+        """Run the model forward pass and return sampled tokens."""
+        if is_prefill:
+            batch, input_ids = self.prepare_prefill_batch(requests, prefix_indices_list)
         else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
-
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        reset_context()
+            batch, input_ids = self.prepare_decode_batch(requests)
+            
+        if batch is None or input_ids is None:
+            return None
+            
+        # Forward pass
+        # Call model.model directly since Qwen3Model accepts forward_batch
+        hidden_states = self.model.model(input_ids, forward_batch=batch)
+        
+        # Apply LM head
+        logits = self.logits_processor(hidden_states, batch, self.model, self.model_args.tie_word_embeddings)
+        # Sample tokens
+        token_ids = self.sampler(logits, batch)
         return token_ids

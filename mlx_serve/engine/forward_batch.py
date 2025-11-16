@@ -21,6 +21,17 @@ class ForwardBatch:
     top_ks: mx.array = None
     top_ps: mx.array = None
 
+    def __init__(self, request_ids: list[int], seq_lens: mx.array, offsets: mx.array, forward_type: ForwardType, temperatures: mx.array = None, top_ks: mx.array = None, top_ps: mx.array = None):
+        self.request_ids = request_ids
+        self.seq_lens = seq_lens
+        self.offsets = offsets
+        self.forward_type = forward_type
+        self.temperatures = temperatures
+        self.top_ks = top_ks
+        self.top_ps = top_ps
+        self._init_position_ids()
+        self._init_last_positions()
+
 
     def _init_position_ids(self):
         batch_size = len(self.seq_lens)

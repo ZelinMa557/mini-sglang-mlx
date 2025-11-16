@@ -105,7 +105,6 @@ class RadixCache(BasePrefixCache):
         self.root_node.lock_ref = 1
         self.evictable_size_ = 0
         self.protected_size_ = 0
-        self._record_all_cleared_event()
 
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -241,8 +240,6 @@ class RadixCache(BasePrefixCache):
             if len(x.parent.children) == 0:
                 heapq.heappush(leaves, x.parent)
 
-            self._record_remove_event(x)
-
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
             return 0
@@ -318,7 +315,6 @@ class RadixCache(BasePrefixCache):
 
     def _split_node(self, key, child: TreeNode, split_len: int):
         # new_node -> child
-        self._record_remove_event(child)
         new_node = TreeNode()
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
