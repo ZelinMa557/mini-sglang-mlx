@@ -3,6 +3,7 @@ from typing import List, Optional, Tuple
 import mlx.core as mx
 
 from mlx_serve.engine.forward_request import ForwardRequest, ForwardRequestStatus
+from mlx_serve.engine.forward_batch import ForwardBatch, ForwardType
 from mlx_serve.mem_cache.memory_pool import ReqToTokenPool
 from mlx_serve.mem_cache.allocator import TokenToKVPoolAllocator
 from mlx_serve.mem_cache.radix_cache import RadixCache, TreeNode
@@ -96,16 +97,25 @@ class Scheduler:
             tokens_to_evict = required_tokens - available
             self.radix_cache.evict(tokens_to_evict)
 
-    def schedule(self) -> Tuple[List[ForwardRequest], bool, List[Optional[mx.array]]]:
+    def schedule(self) -> Tuple[Optional[ForwardBatch], Optional[mx.array], List[ForwardRequest]]:
         """
-        Schedule requests for processing.
+        Schedule requests and construct ForwardBatch.
         Returns:
-            (scheduled_requests, is_prefill, prefix_indices_list)
+            (forward_batch, input_ids, scheduled_requests) or (None, None, []) if no requests to schedule
         """
         scheduled_requests = []
+        input_ids_list = []
+        seq_lens = []
+        offsets = []
+        request_ids = []
+        temperatures = []
+        top_ks = []
+        top_ps = []
         prefix_indices_list = []
         num_seqs = 0
         num_batched_tokens = 0
+        is_prefill = False
+        current_offset = 0
         
         # Try to schedule prefill requests first
         while self.waiting and num_seqs < self.max_num_seqs:
@@ -159,6 +169,19 @@ class Scheduler:
                 kv_indices,
             )
             
+            # Prepare batch data
+            tokens_to_process = all_tokens[prefix_len:]
+            input_ids_list.extend(tokens_to_process)
+            seq_len = len(tokens_to_process)
+            seq_lens.append(seq_len)
+            offsets.append(current_offset)
+            current_offset += seq_len
+            request_ids.append(request.id)
+            temperatures.append(request.temperature if request.temperature is not None else 1.0)
+            top_ks.append(request.top_k if request.top_k is not None else -1)
+            top_ps.append(request.top_p if request.top_p is not None else 1.0)
+            prefix_indices_list.append(prefix_indices)
+            
             # Update state
             num_seqs += 1
             num_batched_tokens += num_new_tokens
@@ -166,15 +189,37 @@ class Scheduler:
             self.waiting.popleft()
             self.running.append(request)
             scheduled_requests.append(request)
-            prefix_indices_list.append(prefix_indices)
             self.request_prefix_state[request.id] = (prefix_indices, last_node)
             self.request_pool_indices[request.id] = req_pool_idx
             self.request_kv_indices[request.id] = kv_indices
+            is_prefill = True
         
         if scheduled_requests:
-            return scheduled_requests, True, prefix_indices_list
+            # Construct ForwardBatch for prefill
+            input_ids = mx.array(input_ids_list, dtype=mx.int32)
+            forward_batch = ForwardBatch(
+                request_ids=request_ids,
+                seq_lens=mx.array(seq_lens, dtype=mx.int32),
+                offsets=mx.array(offsets, dtype=mx.int32),
+                forward_type=ForwardType.prefill,
+                temperatures=mx.array(temperatures, dtype=mx.float32),
+                top_ks=mx.array(top_ks, dtype=mx.int32),
+                top_ps=mx.array(top_ps, dtype=mx.float32),
+            )
+            # Store prefix_indices_list for later use in postprocess
+            forward_batch.prefix_indices_list = prefix_indices_list
+            return forward_batch, input_ids, scheduled_requests
         
         # Schedule decode requests
+        input_ids_list = []
+        seq_lens = []
+        offsets = []
+        request_ids = []
+        temperatures = []
+        top_ks = []
+        top_ps = []
+        current_offset = 0
+        
         while self.running and num_seqs < self.max_num_seqs:
             request = self.running.popleft()
             all_tokens = (request.input_tokens or []) + (request.generated_tokens or [])
@@ -212,18 +257,39 @@ class Scheduler:
                 new_kv_index,
             )
             
+            # Prepare batch data for decode
+            last_token = all_tokens[-1]
+            input_ids_list.append(last_token)
+            seq_lens.append(1)
+            offsets.append(current_offset)
+            current_offset += 1
+            request_ids.append(request.id)
+            temperatures.append(request.temperature if request.temperature is not None else 1.0)
+            top_ks.append(request.top_k if request.top_k is not None else -1)
+            top_ps.append(request.top_p if request.top_p is not None else 1.0)
+            
             num_seqs += 1
             scheduled_requests.append(request)
-            prefix_indices_list.append(None)  # No prefix for decode
             self.request_kv_indices[request.id] = updated_kv_indices
         
         if scheduled_requests:
+            # Construct ForwardBatch for decode
+            input_ids = mx.array(input_ids_list, dtype=mx.int32)
+            forward_batch = ForwardBatch(
+                request_ids=request_ids,
+                seq_lens=mx.array(seq_lens, dtype=mx.int32),
+                offsets=mx.array(offsets, dtype=mx.int32),
+                forward_type=ForwardType.decode,
+                temperatures=mx.array(temperatures, dtype=mx.float32),
+                top_ks=mx.array(top_ks, dtype=mx.int32),
+                top_ps=mx.array(top_ps, dtype=mx.float32),
+            )
             # Put scheduled requests back to running queue
             self.running.extendleft(reversed(scheduled_requests))
-            return scheduled_requests, False, prefix_indices_list
+            return forward_batch, input_ids, scheduled_requests
         
-        # Should not reach here
-        return [], False, []
+        # No requests to schedule
+        return None, None, []
 
     def preempt(self, request: ForwardRequest):
         """Preempt a running request and move it back to waiting queue."""
