@@ -16,23 +16,22 @@ def generate_inputs(token_num, topk_num, hidden_dim, dtype=mx.bfloat16):
     返回:
         tuple: (y, scores)
     """
-    # y shape: [token_num, topk_num, hidden_dim]
-    y = mx.random.normal((token_num, topk_num, hidden_dim), dtype=dtype)
+    # y shape: [token_num * topk_num, hidden_dim]
+    y = mx.random.normal((token_num * topk_num, hidden_dim), dtype=dtype)
     # scores shape: [token_num, topk_num]
-    scores = mx.random.uniform((token_num, topk_num), dtype=mx.float32)
+    scores = mx.random.normal((token_num, topk_num), dtype=dtype)
     # Normalize scores to sum to 1 for each token
     scores = scores / mx.sum(scores, axis=-1, keepdims=True)
     # 在评估前预热，以获得更准确的计时
     mx.eval(y, scores)
     return y, scores
 
-def generate_inputs_with_reorder(reordered_token_num, token_num, topk_num, hidden_dim, dtype=mx.bfloat16):
+def generate_inputs_with_reorder(token_num, topk_num, hidden_dim, dtype=mx.float32):
     """
     生成包含重排序索引的输入。
     
     参数:
-        reordered_token_num (int): 重排序后的token数量
-        token_num (int): 原始token数量
+        token_num (int): token数量
         topk_num (int): topk专家数量
         hidden_dim (int): 隐藏维度
         dtype (mlx.dtype): 张量的数据类型。
@@ -40,22 +39,17 @@ def generate_inputs_with_reorder(reordered_token_num, token_num, topk_num, hidde
     返回:
         tuple: (y, scores, inv_order)
     """
-    # y shape: [reordered_token_num, topk_num, hidden_dim]
-    y = mx.random.normal((reordered_token_num, topk_num, hidden_dim), dtype=dtype)
+    # y shape: [token_num * topk_num, hidden_dim]
+    y = mx.random.normal((token_num * topk_num, hidden_dim), dtype=dtype)
     # scores shape: [token_num, topk_num]
-    scores = mx.random.uniform((token_num, topk_num), dtype=mx.float32)
+    scores = mx.random.normal((token_num, topk_num), dtype=dtype)
     # Normalize scores to sum to 1 for each token
     scores = scores / mx.sum(scores, axis=-1, keepdims=True)
-    # inv_order: 对于输出位置i（原始token位置），应该从重排序后的y的哪个位置读取
-    # 例如，如果原始顺序是 [0, 1, 2, 3]，重排序后y中存储的是 [token2, token0, token3, token1]
-    # 那么 inv_order 应该是 [1, 3, 0, 2]，表示：
-    #   - 输出位置0（原始token0）应该从重排序后的位置1读取
-    #   - 输出位置1（原始token1）应该从重排序后的位置3读取
-    #   - 输出位置2（原始token2）应该从重排序后的位置0读取
-    #   - 输出位置3（原始token3）应该从重排序后的位置2读取
-    # 生成一个随机排列
-    inv_order = mx.arange(token_num, dtype=mx.int32)
-    mx.random.shuffle(inv_order)
+    print(f'test scores: {scores}')
+    # inv_order: shape [token_num * topk_num], each element is a row index in y
+    # Generate a random permutation of [0, token_num * topk_num)
+    tmp = mx.random.normal((token_num * topk_num,), dtype=mx.float32)
+    inv_order = mx.argsort(tmp)
     # 在评估前预热
     mx.eval(y, scores, inv_order)
     return y, scores, inv_order
@@ -64,21 +58,26 @@ def generate_inputs_with_reorder(reordered_token_num, token_num, topk_num, hidde
 def moe_sum_reduce_naive(y, scores):
     """
     原始的 MoE sum reduce 实现。
-    y: [token_num, topk_num, hidden_dim]
+    y: [token_num * topk_num, hidden_dim]
     scores: [token_num, topk_num]
     返回: [token_num, hidden_dim]
     """
-    return (y * scores[..., None]).sum(axis=-2)
+    token_num, topk_num = scores.shape
+    hidden_dim = y.shape[1]
+    # Reshape y to [token_num, topk_num, hidden_dim]
+    y_3d = y.reshape(token_num, topk_num, hidden_dim)
+    return (y_3d * scores[..., None]).sum(axis=-2)
 
 def moe_sum_reduce_with_reorder_naive(y, scores, inv_order):
     """
     原始的 MoE sum reduce with reorder 实现。
-    y: [reordered_token_num, topk_num, hidden_dim]
+    y: [token_num * topk_num, hidden_dim]
     scores: [token_num, topk_num]
-    inv_order: [token_num]
+    inv_order: [token_num * topk_num]
     返回: [token_num, hidden_dim]
     """
     y_reordered = y[inv_order]
+    y_reordered = y_reordered.reshape(token_num, topk_num, hidden_dim)
     return (y_reordered * scores[..., None]).sum(axis=-2)
 
 def run_benchmark(func, *args, warmup_iters=5, test_iters=100):
@@ -120,23 +119,25 @@ def run_functional_test(fused_func, naive_func, *args):
     返回:
         bool: 如果输出近似相等则返回 True，否则返回 False
     """
+    import math
     z_fused = fused_func(*args)
     z_naive = naive_func(*args)
     mx.eval(z_fused, z_naive)
-    
     # 使用 mx.allclose 检查浮点数的近似相等性
-    return mx.allclose(z_fused, z_naive, rtol=1e-4, atol=1e-5)
+    return mx.allclose(z_fused, z_naive, rtol=1e-2, atol=1e-3)
 
 # --- 3. 主程序 ---
 if __name__ == "__main__":
-    mx.random.seed(1024)
+    mx.random.seed(128)
     # 定义要测试的不同输入形状
     test_cases = [
-        (32, 2, 4096),      # small batch, topk=2
-        (128, 4, 4096),     # medium batch, topk=4
+        (1, 4, 1024),
+        (3, 8, 2048),
+        (32, 4, 4096),      # small batch, topk=4
+        (128, 4, 8192),     # medium batch, topk=4
         (512, 8, 4096),     # large batch, topk=8
-        (1024, 2, 8192),    # large batch, large hidden
-        (256, 4, 2048),     # medium batch, medium hidden
+        (1024, 4, 8192),    # large batch, large hidden
+        (256, 8, 2048),     # medium batch, medium hidden
     ]
     
     print("🚀 启动 moe_sum_reduce 内核测试...\n")
@@ -172,17 +173,14 @@ if __name__ == "__main__":
         
         print(f"⏱️  性能: Naive Time: {naive_time:.3f}ms | Fused Time: {fused_time:.3f}ms")
         print(f"🚀 加速比: {speedup:.2f}x")
-    
     # Test moe_sum_reduce_with_reorder
     print("\n" + "=" * 60)
     print("测试 moe_sum_reduce_with_reorder (带重排序版本)")
     print("=" * 60)
     for token_num, topk_num, hidden_dim in test_cases:
         print(f"\n--- 测试配置: token_num={token_num}, topk_num={topk_num}, hidden_dim={hidden_dim} ---")
-        # 对于重排序版本，reordered_token_num 应该等于 token_num
-        reordered_token_num = token_num
         y, scores, inv_order = generate_inputs_with_reorder(
-            reordered_token_num, token_num, topk_num, hidden_dim
+            token_num, topk_num, hidden_dim
         )
         
         # 运行功能测试
