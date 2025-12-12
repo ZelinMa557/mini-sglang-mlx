@@ -20,8 +20,10 @@ class ForwardBatch:
     temperatures: mx.array = None
     top_ks: mx.array = None
     top_ps: mx.array = None
+    input_ids: mx.array = None
+    scheduled_requests: list = None
 
-    def __init__(self, request_ids: list[int], seq_lens: mx.array, offsets: mx.array, forward_type: ForwardType, temperatures: mx.array = None, top_ks: mx.array = None, top_ps: mx.array = None):
+    def __init__(self, request_ids: list[int], seq_lens: mx.array, offsets: mx.array, forward_type: ForwardType, temperatures: mx.array = None, top_ks: mx.array = None, top_ps: mx.array = None, input_ids: mx.array = None, scheduled_requests: list = None):
         self.request_ids = request_ids
         self.seq_lens = seq_lens
         self.offsets = offsets
@@ -29,8 +31,11 @@ class ForwardBatch:
         self.temperatures = temperatures
         self.top_ks = top_ks
         self.top_ps = top_ps
-        self._init_position_ids()
-        self._init_last_positions()
+        self.input_ids = input_ids
+        self.scheduled_requests = scheduled_requests or []
+        if seq_lens is not None and len(seq_lens) > 0:
+            self._init_position_ids()
+            self._init_last_positions()
 
 
     def _init_position_ids(self):

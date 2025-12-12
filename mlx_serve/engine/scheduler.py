@@ -1,5 +1,6 @@
 from collections import deque
 from typing import List, Optional, Tuple
+import logging
 import mlx.core as mx
 
 from mlx_serve.engine.forward_request import ForwardRequest, ForwardRequestStatus
@@ -7,6 +8,8 @@ from mlx_serve.engine.forward_batch import ForwardBatch, ForwardType
 from mlx_serve.mem_cache.memory_pool import ReqToTokenPool
 from mlx_serve.mem_cache.allocator import TokenToKVPoolAllocator
 from mlx_serve.mem_cache.radix_cache import RadixCache, TreeNode
+
+logger = logging.getLogger(__name__)
 
 
 class Scheduler:
@@ -97,12 +100,154 @@ class Scheduler:
             tokens_to_evict = required_tokens - available
             self.radix_cache.evict(tokens_to_evict)
 
-    def schedule(self) -> Tuple[Optional[ForwardBatch], Optional[mx.array], List[ForwardRequest]]:
+    def _get_request_tokens(self, request: ForwardRequest) -> List[int]:
+        """Get all tokens (input + generated) for a request."""
+        return (request.input_tokens or []) + (request.generated_tokens or [])
+
+    def _get_request_seq_len(self, request: ForwardRequest) -> int:
+        """Get the current sequence length of a request."""
+        return len(self._get_request_tokens(request))
+
+    def _preempt_requests_if_needed(self, num_slots_needed: int) -> int:
         """
-        Schedule requests and construct ForwardBatch.
+        Preempt running requests if needed to make room for new requests.
+        
+        Args:
+            num_slots_needed: Number of slots needed for new requests
+            
         Returns:
-            (forward_batch, input_ids, scheduled_requests) or (None, None, []) if no requests to schedule
+            Number of requests preempted
         """
+        num_preempted = 0
+        available_slots = self.max_num_seqs - len(self.running)
+        
+        # If we have enough slots, no need to preempt
+        if available_slots >= num_slots_needed:
+            return 0
+        
+        # Calculate how many requests we need to preempt
+        slots_to_free = num_slots_needed - available_slots
+        
+        # Sort running requests by sequence length (longest first) for preemption
+        # Longer sequences use more KV cache and should be preempted first
+        running_list = list(self.running)
+        running_list.sort(
+            key=lambda r: self._get_request_seq_len(r),
+            reverse=True
+        )
+        
+        # Preempt the longest requests
+        for request in running_list:
+            if num_preempted >= slots_to_free:
+                break
+            
+            # Preempt this request
+            self.preempt(request)
+            num_preempted += 1
+            logger.info(
+                f"Preempted request {request.id} (seq_len={self._get_request_seq_len(request)}) "
+                f"to make room for new requests"
+            )
+        
+        return num_preempted
+
+    def _extract_request_params(self, request: ForwardRequest) -> Tuple[float, int, float]:
+        """Extract temperature, top_k, and top_p from request with defaults."""
+        temperature = request.temperature if request.temperature is not None else 1.0
+        top_k = request.top_k if request.top_k is not None else -1
+        top_p = request.top_p if request.top_p is not None else 1.0
+        return temperature, top_k, top_p
+
+    def _build_forward_batch(
+        self,
+        request_ids: List[int],
+        input_ids_list: List[int],
+        seq_lens: List[int],
+        offsets: List[int],
+        temperatures: List[float],
+        top_ks: List[int],
+        top_ps: List[float],
+        forward_type: ForwardType,
+        scheduled_requests: List[ForwardRequest],
+        prefix_indices_list: Optional[List[mx.array]] = None,
+    ) -> ForwardBatch:
+        """Build a ForwardBatch object from collected batch data."""
+        input_ids = mx.array(input_ids_list, dtype=mx.int32)
+        forward_batch = ForwardBatch(
+            request_ids=request_ids,
+            seq_lens=mx.array(seq_lens, dtype=mx.int32),
+            offsets=mx.array(offsets, dtype=mx.int32),
+            forward_type=forward_type,
+            temperatures=mx.array(temperatures, dtype=mx.float32),
+            top_ks=mx.array(top_ks, dtype=mx.int32),
+            top_ps=mx.array(top_ps, dtype=mx.float32),
+            input_ids=input_ids,
+            scheduled_requests=scheduled_requests,
+        )
+        if prefix_indices_list is not None:
+            forward_batch.prefix_indices_list = prefix_indices_list
+        return forward_batch
+
+    def _try_allocate_kv_cache_with_eviction(
+        self,
+        request: ForwardRequest,
+        prefix_indices: mx.array,
+        num_new_tokens: int,
+    ) -> Optional[mx.array]:
+        """Try to allocate KV cache with eviction if needed."""
+        self._evict_if_needed(num_new_tokens)
+        kv_indices = self._allocate_kv_cache_for_request(request, prefix_indices, num_new_tokens)
+        
+        if kv_indices is None:
+            # Try evicting more aggressively
+            self._evict_if_needed(num_new_tokens)
+            kv_indices = self._allocate_kv_cache_for_request(request, prefix_indices, num_new_tokens)
+        
+        return kv_indices
+
+    def _process_prefill_request(
+        self,
+        request: ForwardRequest,
+        prefix_indices: mx.array,
+        last_node: TreeNode,
+        prefix_len: int,
+        num_new_tokens: int,
+    ) -> Optional[Tuple[int, mx.array, List[int], int]]:
+        """
+        Process a single prefill request.
+        Returns: (req_pool_idx, kv_indices, tokens_to_process, seq_len) or None if failed.
+        """
+        # Try to allocate KV cache
+        kv_indices = self._try_allocate_kv_cache_with_eviction(request, prefix_indices, num_new_tokens)
+        if kv_indices is None:
+            return None
+        
+        # Allocate request pool slot
+        req_pool_idx_array = self.req_to_token_pool.alloc(1)
+        if req_pool_idx_array is None or len(req_pool_idx_array) == 0:
+            # Free allocated KV cache if request pool allocation failed
+            self.token_to_kv_pool_allocator.free(kv_indices[prefix_len:] if prefix_len > 0 else kv_indices)
+            return None
+        
+        req_pool_idx = req_pool_idx_array[0]
+        
+        # Write token to KV mapping
+        self.req_to_token_pool.write(
+            (req_pool_idx, slice(0, len(kv_indices))),
+            kv_indices,
+        )
+        
+        # Prepare tokens to process
+        all_tokens = self._get_request_tokens(request)
+        tokens_to_process = all_tokens[prefix_len:]
+        seq_len = len(tokens_to_process)
+        
+        return req_pool_idx, kv_indices, tokens_to_process, seq_len
+
+    def _schedule_prefill_requests(
+        self,
+    ) -> Optional[ForwardBatch]:
+        """Schedule prefill requests from waiting queue."""
         scheduled_requests = []
         input_ids_list = []
         seq_lens = []
@@ -114,13 +259,20 @@ class Scheduler:
         prefix_indices_list = []
         num_seqs = 0
         num_batched_tokens = 0
-        is_prefill = False
         current_offset = 0
         
-        # Try to schedule prefill requests first
         while self.waiting and num_seqs < self.max_num_seqs:
+            # Check if we need to preempt running requests to make room
+            available_slots = self.max_num_seqs - len(self.running)
+            if available_slots <= 0:
+                # No available slots, try to preempt one request
+                preempted = self._preempt_requests_if_needed(1)
+                if preempted == 0:
+                    # Could not preempt any request, cannot schedule more
+                    break
+            
             request = self.waiting[0]
-            all_tokens = (request.input_tokens or []) + (request.generated_tokens or [])
+            all_tokens = self._get_request_tokens(request)
             
             if len(all_tokens) == 0:
                 self.waiting.popleft()
@@ -133,6 +285,13 @@ class Scheduler:
             
             if num_new_tokens <= 0:
                 # All tokens are in prefix cache, treat as decode
+                # Check if we have space in running queue
+                if len(self.running) >= self.max_num_seqs:
+                    # Need to preempt to make room
+                    preempted = self._preempt_requests_if_needed(1)
+                    if preempted == 0:
+                        # Cannot preempt, skip this request for now
+                        break
                 self.waiting.popleft()
                 self.running.append(request)
                 self.request_prefix_state[request.id] = (prefix_indices, last_node)
@@ -142,44 +301,35 @@ class Scheduler:
             if num_batched_tokens + num_new_tokens > self.max_num_batched_tokens:
                 break
             
-            # Check if we have enough KV cache space
-            self._evict_if_needed(num_new_tokens)
-            kv_indices = self._allocate_kv_cache_for_request(request, prefix_indices, num_new_tokens)
-            
-            if kv_indices is None:
-                # Not enough space, try to evict more
-                self._evict_if_needed(num_new_tokens)
-                kv_indices = self._allocate_kv_cache_for_request(request, prefix_indices, num_new_tokens)
-                if kv_indices is None:
-                    # Still not enough space, skip this request
+            # Process the prefill request
+            result = self._process_prefill_request(
+                request, prefix_indices, last_node, prefix_len, num_new_tokens
+            )
+            if result is None:
+                # Allocation failed, might need to preempt more aggressively
+                # Try preempting one more request and retry
+                if len(self.running) > 0:
+                    preempted = self._preempt_requests_if_needed(1)
+                    if preempted > 0:
+                        # Retry allocation after preemption
+                        result = self._process_prefill_request(
+                            request, prefix_indices, last_node, prefix_len, num_new_tokens
+                        )
+                if result is None:
                     break
             
-            # Allocate request pool slot
-            req_pool_idx = self.req_to_token_pool.alloc(1)
-            if req_pool_idx is None or len(req_pool_idx) == 0:
-                # No available request pool slots
-                self.token_to_kv_pool_allocator.free(kv_indices[prefix_len:] if prefix_len > 0 else kv_indices)
-                break
+            req_pool_idx, kv_indices, tokens_to_process, seq_len = result
             
-            req_pool_idx = req_pool_idx[0]
-            
-            # Write token to KV mapping
-            self.req_to_token_pool.write(
-                (req_pool_idx, slice(0, len(kv_indices))),
-                kv_indices,
-            )
-            
-            # Prepare batch data
-            tokens_to_process = all_tokens[prefix_len:]
+            # Collect batch data
             input_ids_list.extend(tokens_to_process)
-            seq_len = len(tokens_to_process)
             seq_lens.append(seq_len)
             offsets.append(current_offset)
             current_offset += seq_len
             request_ids.append(request.id)
-            temperatures.append(request.temperature if request.temperature is not None else 1.0)
-            top_ks.append(request.top_k if request.top_k is not None else -1)
-            top_ps.append(request.top_p if request.top_p is not None else 1.0)
+            temp, top_k, top_p = self._extract_request_params(request)
+            temperatures.append(temp)
+            top_ks.append(top_k)
+            top_ps.append(top_p)
             prefix_indices_list.append(prefix_indices)
             
             # Update state
@@ -192,25 +342,62 @@ class Scheduler:
             self.request_prefix_state[request.id] = (prefix_indices, last_node)
             self.request_pool_indices[request.id] = req_pool_idx
             self.request_kv_indices[request.id] = kv_indices
-            is_prefill = True
         
         if scheduled_requests:
-            # Construct ForwardBatch for prefill
-            input_ids = mx.array(input_ids_list, dtype=mx.int32)
-            forward_batch = ForwardBatch(
-                request_ids=request_ids,
-                seq_lens=mx.array(seq_lens, dtype=mx.int32),
-                offsets=mx.array(offsets, dtype=mx.int32),
-                forward_type=ForwardType.prefill,
-                temperatures=mx.array(temperatures, dtype=mx.float32),
-                top_ks=mx.array(top_ks, dtype=mx.int32),
-                top_ps=mx.array(top_ps, dtype=mx.float32),
+            forward_batch = self._build_forward_batch(
+                request_ids, input_ids_list, seq_lens, offsets,
+                temperatures, top_ks, top_ps, ForwardType.prefill, scheduled_requests, prefix_indices_list
             )
-            # Store prefix_indices_list for later use in postprocess
-            forward_batch.prefix_indices_list = prefix_indices_list
-            return forward_batch, input_ids, scheduled_requests
+            return forward_batch
         
-        # Schedule decode requests
+        return None
+
+    def _process_decode_request(
+        self,
+        request: ForwardRequest,
+    ) -> Optional[Tuple[mx.array, int]]:
+        """
+        Process a single decode request.
+        Returns: (updated_kv_indices, last_token) or None if failed.
+        """
+        all_tokens = self._get_request_tokens(request)
+        if len(all_tokens) == 0:
+            return None
+        
+        # Check if we can append one more token
+        current_kv_indices = self.request_kv_indices.get(request.id)
+        if current_kv_indices is None:
+            return None
+        
+        # Try to allocate space for one more token
+        self._evict_if_needed(1)
+        new_kv_index = self.token_to_kv_pool_allocator.alloc(1)
+        
+        if new_kv_index is None or len(new_kv_index) == 0:
+            # Try evicting more aggressively
+            self._evict_if_needed(1)
+            new_kv_index = self.token_to_kv_pool_allocator.alloc(1)
+            if new_kv_index is None or len(new_kv_index) == 0:
+                return None
+        
+        # Append new KV index
+        updated_kv_indices = mx.concatenate([current_kv_indices, new_kv_index])
+        
+        # Update request pool mapping
+        req_pool_idx = self.request_pool_indices[request.id]
+        self.req_to_token_pool.write(
+            (req_pool_idx, slice(len(current_kv_indices), len(updated_kv_indices))),
+            new_kv_index,
+        )
+        
+        last_token = all_tokens[-1]
+        return updated_kv_indices, last_token
+
+    def _schedule_decode_requests(
+        self,
+    ) -> Optional[ForwardBatch]:
+        """Schedule decode requests from running queue."""
+        scheduled_requests = []
         input_ids_list = []
         seq_lens = []
         offsets = []
@@ -219,77 +406,80 @@ class Scheduler:
         top_ks = []
         top_ps = []
         current_offset = 0
+        num_seqs = 0
         
         while self.running and num_seqs < self.max_num_seqs:
             request = self.running.popleft()
-            all_tokens = (request.input_tokens or []) + (request.generated_tokens or [])
             
-            if len(all_tokens) == 0:
-                continue
-            
-            # Check if we can append one more token
-            current_kv_indices = self.request_kv_indices.get(request.id)
-            if current_kv_indices is None:
-                # This shouldn't happen, but handle it gracefully
+            # Process the decode request
+            result = self._process_decode_request(request)
+            if result is None:
+                # If processing failed, put request back to running queue
                 self.running.append(request)
                 continue
             
-            # Check if we have space for one more token
-            self._evict_if_needed(1)
-            new_kv_index = self.token_to_kv_pool_allocator.alloc(1)
+            updated_kv_indices, last_token = result
             
-            if new_kv_index is None or len(new_kv_index) == 0:
-                # Not enough space, try to evict
-                self._evict_if_needed(1)
-                new_kv_index = self.token_to_kv_pool_allocator.alloc(1)
-                if new_kv_index is None or len(new_kv_index) == 0:
-                    # Still not enough space, skip this request
-                    self.running.append(request)
-                    continue
-            
-            # Append new KV index
-            updated_kv_indices = mx.concatenate([current_kv_indices, new_kv_index])
-            
-            # Update request pool mapping
-            req_pool_idx = self.request_pool_indices[request.id]
-            self.req_to_token_pool.write(
-                (req_pool_idx, slice(len(current_kv_indices), len(updated_kv_indices))),
-                new_kv_index,
-            )
-            
-            # Prepare batch data for decode
-            last_token = all_tokens[-1]
+            # Collect batch data
             input_ids_list.append(last_token)
             seq_lens.append(1)
             offsets.append(current_offset)
             current_offset += 1
             request_ids.append(request.id)
-            temperatures.append(request.temperature if request.temperature is not None else 1.0)
-            top_ks.append(request.top_k if request.top_k is not None else -1)
-            top_ps.append(request.top_p if request.top_p is not None else 1.0)
+            temp, top_k, top_p = self._extract_request_params(request)
+            temperatures.append(temp)
+            top_ks.append(top_k)
+            top_ps.append(top_p)
             
+            # Update state
             num_seqs += 1
             scheduled_requests.append(request)
             self.request_kv_indices[request.id] = updated_kv_indices
         
         if scheduled_requests:
-            # Construct ForwardBatch for decode
-            input_ids = mx.array(input_ids_list, dtype=mx.int32)
-            forward_batch = ForwardBatch(
-                request_ids=request_ids,
-                seq_lens=mx.array(seq_lens, dtype=mx.int32),
-                offsets=mx.array(offsets, dtype=mx.int32),
-                forward_type=ForwardType.decode,
-                temperatures=mx.array(temperatures, dtype=mx.float32),
-                top_ks=mx.array(top_ks, dtype=mx.int32),
-                top_ps=mx.array(top_ps, dtype=mx.float32),
+            forward_batch = self._build_forward_batch(
+                request_ids, input_ids_list, seq_lens, offsets,
+                temperatures, top_ks, top_ps, ForwardType.decode, scheduled_requests
             )
             # Put scheduled requests back to running queue
             self.running.extendleft(reversed(scheduled_requests))
-            return forward_batch, input_ids, scheduled_requests
+            return forward_batch
         
-        # No requests to schedule
-        return None, None, []
+        return None
+
+    def schedule(self) -> Optional[ForwardBatch]:
+        """
+        Schedule requests and construct ForwardBatch.
+        Returns:
+            ForwardBatch if there are requests to schedule, None otherwise.
+        """
+        # Try to schedule prefill requests first
+        forward_batch = self._schedule_prefill_requests()
+        if forward_batch is not None:
+            # Log batch information
+            batch_type = "prefill" if forward_batch.forward_type == ForwardType.prefill else "decode"
+            num_tokens = len(forward_batch.input_ids) if forward_batch.input_ids is not None else 0
+            num_requests = len(forward_batch.scheduled_requests) if forward_batch.scheduled_requests else 0
+            request_ids = [r.id for r in forward_batch.scheduled_requests] if forward_batch.scheduled_requests else []
+            logger.info(
+                f"Scheduled {batch_type} batch: {num_requests} requests (ids: {request_ids}), "
+                f"{num_tokens} tokens, waiting={len(self.waiting)}, running={len(self.running)}"
+            )
+            return forward_batch
+        
+        # Schedule decode requests
+        forward_batch = self._schedule_decode_requests()
+        if forward_batch is not None:
+            # Log batch information
+            batch_type = "decode" if forward_batch.forward_type == ForwardType.decode else "prefill"
+            num_tokens = len(forward_batch.input_ids) if forward_batch.input_ids is not None else 0
+            num_requests = len(forward_batch.scheduled_requests) if forward_batch.scheduled_requests else 0
+            request_ids = [r.id for r in forward_batch.scheduled_requests] if forward_batch.scheduled_requests else []
+            logger.info(
+                f"Scheduled {batch_type} batch: {num_requests} requests (ids: {request_ids}), "
+                f"{num_tokens} tokens, waiting={len(self.waiting)}, running={len(self.running)}"
+            )
+        return forward_batch
 
     def preempt(self, request: ForwardRequest):
         """Preempt a running request and move it back to waiting queue."""
@@ -323,17 +513,25 @@ class Scheduler:
 
     def postprocess(
         self,
-        requests: List[ForwardRequest],
+        forward_batch: ForwardBatch,
         token_ids: mx.array,
     ) -> List[bool]:
         """
         Postprocess after model forward pass.
         Returns list of booleans indicating which requests are finished.
+        
+        Args:
+            forward_batch: The ForwardBatch that was processed (contains scheduled_requests)
+            token_ids: The sampled token IDs from model forward pass
         """
         finished_flags = []
         
-        if token_ids is None:
-            return [False] * len(requests)
+        if forward_batch is None or token_ids is None:
+            return []
+        
+        requests = forward_batch.scheduled_requests
+        if not requests:
+            return []
         
         token_ids_list = token_ids.tolist() if hasattr(token_ids, 'tolist') else list(token_ids)
         

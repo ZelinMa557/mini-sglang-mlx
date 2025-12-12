@@ -36,36 +36,36 @@ class ModelRunner:
 
     def warmup_model(self):
         """Warmup the model with dummy inputs."""
-        input_ids = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        input_ids = mx.array([1, 2, 3, 4, 5], dtype=mx.int32)
         forward_batch = ForwardBatch(
             request_ids=[0],
-            seq_lens=[5],
-            offsets=[0],
+            seq_lens=mx.array([5], dtype=mx.int32),
+            offsets=mx.array([0], dtype=mx.int32),
             forward_type=ForwardType.prefill,
-            temperatures=[1.0],
+            temperatures=mx.array([1.0], dtype=mx.float32),
+            input_ids=input_ids,
+            scheduled_requests=[],
         )
-        self.model(input_ids, forward_batch)
+        self.model.model(input_ids, forward_batch=forward_batch)
 
     def run(
         self,
         forward_batch: ForwardBatch,
-        input_ids: mx.array,
     ) -> Optional[mx.array]:
         """
         Run the model forward pass on a prepared batch.
         
         Args:
-            forward_batch: The ForwardBatch prepared by scheduler
-            input_ids: The input token IDs array
+            forward_batch: The ForwardBatch prepared by scheduler (contains input_ids and scheduled_requests)
             
         Returns:
             Sampled token IDs array, or None if batch is invalid
         """
-        if forward_batch is None or input_ids is None:
+        if forward_batch is None or forward_batch.input_ids is None:
             return None
         
         # Forward pass through model
-        hidden_states = self.model.model(input_ids, forward_batch=forward_batch)
+        hidden_states = self.model.model(forward_batch.input_ids, forward_batch=forward_batch)
         
         # Process logits (apply LM head and get logprobs for last positions)
         logits = self.logits_processor(
