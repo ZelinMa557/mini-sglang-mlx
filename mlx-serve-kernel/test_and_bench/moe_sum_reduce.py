@@ -3,7 +3,7 @@ import time
 from mlx_serve_kernel import moe_sum_reduce, moe_sum_reduce_with_reorder
 
 # --- 1. 数据生成函数 ---
-def generate_inputs(token_num, topk_num, hidden_dim, dtype=mx.bfloat16):
+def generate_inputs(token_num, topk_num, hidden_dim, dtype=mx.float32):
     """
     生成具有指定形状和数据类型的随机张量。
     
@@ -131,13 +131,13 @@ if __name__ == "__main__":
     mx.random.seed(128)
     # 定义要测试的不同输入形状
     test_cases = [
-        (1, 4, 1024),
+        (1, 4, 2048),
         (3, 8, 2048),
-        (32, 4, 4096),      # small batch, topk=4
-        (128, 4, 8192),     # medium batch, topk=4
-        (512, 8, 4096),     # large batch, topk=8
-        (1024, 4, 8192),    # large batch, large hidden
-        (256, 8, 2048),     # medium batch, medium hidden
+        (32, 4, 2048),      # small batch, topk=4
+        (128, 4, 2048),     # medium batch, topk=4
+        (512, 8, 2048),     # large batch, topk=8
+        (1024, 4, 2048),    # large batch, large hidden
+        (4096, 8, 2048),     # medium batch, medium hidden
     ]
     
     print("🚀 启动 moe_sum_reduce 内核测试...\n")

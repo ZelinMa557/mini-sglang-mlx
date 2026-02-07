@@ -92,12 +92,11 @@ void VarlenRope::eval_gpu(
   compute_encoder.set_bytes(base_, 3);
 
   size_t n_batch = in.size() / mat_size;
-  MTL::Size group_dims;
+  MTL::Size group_dims(1,1,1);
   MTL::Size grid_dims;
   if (single) {
     compute_encoder.set_bytes(out_strides, 1, 4);
     uint32_t dim0 = dims_ / 2;
-    group_dims = mlx::core::get_block_dims(dim0, n_batch, 1);
     grid_dims = MTL::Size(dim0, n_batch, 1);
   } else {
     compute_encoder.set_bytes(strides, 3, 4);
@@ -106,7 +105,6 @@ void VarlenRope::eval_gpu(
     uint32_t dim0 = dims_ / 2;
     uint32_t dim1 = in.shape(-2);
     uint32_t dim2 = (n_batch + n_per_thread - 1) / n_per_thread;
-    group_dims = mlx::core::get_block_dims(dim0, dim1, dim2);
     grid_dims = MTL::Size(dim0, dim1, dim2);
   }
   compute_encoder.dispatch_threads(grid_dims, group_dims);

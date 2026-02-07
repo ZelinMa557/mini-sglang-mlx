@@ -133,7 +133,8 @@ void MoeSumReduce::eval_gpu(
   uint32_t dim0 = token_num;
   uint32_t dim1 = hidden_dim / n_reads;
   uint32_t dim2 = 1;
-  MTL::Size group_dims = mlx::core::get_block_dims(dim0, dim1, dim2);
+  // MTL::Size group_dims = mlx::core::get_block_dims(dim0, dim1, dim2);
+  MTL::Size group_dims = MTL::Size(1,1,1);
   MTL::Size grid_dims = MTL::Size(dim0, dim1, dim2);
   compute_encoder.dispatch_threads(grid_dims, group_dims);
 }
@@ -185,7 +186,8 @@ void MoeSumReduceWithReorder::eval_gpu(
   uint32_t dim0 = token_num;
   uint32_t dim1 = hidden_dim / n_reads;
   uint32_t dim2 = 1;
-  MTL::Size group_dims = mlx::core::get_block_dims(dim0, dim1, dim2);
+  // MTL::Size group_dims = mlx::core::get_block_dims(dim0, dim1, dim2);
+  MTL::Size group_dims = MTL::Size(1,1,1);
   MTL::Size grid_dims = MTL::Size(dim0, dim1, dim2);
   compute_encoder.dispatch_threads(grid_dims, group_dims);
 }
