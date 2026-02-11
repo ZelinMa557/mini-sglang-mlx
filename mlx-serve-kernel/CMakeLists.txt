@@ -36,7 +36,9 @@ target_sources(mlx_serve_kernel PUBLIC ${CMAKE_CURRENT_LIST_DIR}/csrc/varlen_rop
                                        ${CMAKE_CURRENT_LIST_DIR}/csrc/fused_add_rmsnorm.cpp
                                        ${CMAKE_CURRENT_LIST_DIR}/csrc/moe_sum_reduce.cpp
                                        ${CMAKE_CURRENT_LIST_DIR}/csrc/store_kv_cache.cpp
-                                       ${CMAKE_CURRENT_LIST_DIR}/csrc/fast_compare_key.cpp)
+                                       ${CMAKE_CURRENT_LIST_DIR}/csrc/fast_compare_key.cpp
+                                       ${CMAKE_CURRENT_LIST_DIR}/csrc/paged_decode_attention.cpp
+                                       ${CMAKE_CURRENT_LIST_DIR}/csrc/paged_prefill_attention.cpp)
 
 # Add include headers
 target_include_directories(mlx_serve_kernel PUBLIC ${CMAKE_CURRENT_LIST_DIR}/csrc)
@@ -58,6 +60,8 @@ if(MLX_BUILD_METAL)
     ${CMAKE_CURRENT_LIST_DIR}/csrc/fused_add_rmsnorm.metal
     ${CMAKE_CURRENT_LIST_DIR}/csrc/moe_sum_reduce.metal
     ${CMAKE_CURRENT_LIST_DIR}/csrc/store_kv_cache.metal
+    ${CMAKE_CURRENT_LIST_DIR}/csrc/paged_decode_attention.metal
+    ${CMAKE_CURRENT_LIST_DIR}/csrc/paged_prefill_attention.metal
     INCLUDE_DIRS
     ${PROJECT_SOURCE_DIR}
     ${MLX_INCLUDE_DIRS}

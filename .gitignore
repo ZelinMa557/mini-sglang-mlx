@@ -1,0 +1,39 @@
+# macOS
+.DS_Store
+
+# Python cache and tooling
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Local virtual environments
+.venv/
+venv/
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+
+# C/C++/CMake temporary files
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+*.o
+*.a
+*.dSYM/
+
+# Local logs and temp files
+*.log
+*.tmp
+
+# mlx-serve-kernel local compile/debug artifacts
+mlx-serve-kernel/build/
+mlx-serve-kernel/mlx_serve_kernel.egg-info/
+mlx-serve-kernel/mlx_serve_kernel/__pycache__/
+mlx-serve-kernel/mlx_serve_kernel/_ext*.so
+mlx-serve-kernel/mlx_serve_kernel/*.dylib
+mlx-serve-kernel/mlx_serve_kernel/*.metallib

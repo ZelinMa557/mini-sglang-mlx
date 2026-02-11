@@ -8,6 +8,8 @@
 #include "moe_sum_reduce.h"
 #include "store_kv_cache.h"
 #include "fast_compare_key.h"
+#include "paged_decode_attention.h"
+#include "paged_prefill_attention.h"
 namespace nb = nanobind;
 using namespace nb::literals;
 
@@ -43,4 +45,24 @@ NB_MODULE(_ext, m) {
   m.def("fast_compare_key", &mlx_serve::fast_compare_key,
         "a"_a, "b"_a,
         nb::sig("def fast_compare_key(a: array, b: array) -> int"));
+  m.def("paged_decode_attention", &mlx_serve::paged_decode_attention,
+        "q"_a, "k_cache"_a, "v_cache"_a, "kv_indptr"_a, "kv_indices"_a,
+        "num_kv_splits"_a, "sm_scale"_a, "max_kv_splits"_a, "window_size"_a,
+        nb::kw_only(), "stream"_a = nb::none(),
+        nb::sig(
+            "def paged_decode_attention(q: array, k_cache: array, v_cache: array, "
+            "kv_indptr: array, kv_indices: array, num_kv_splits: array, "
+            "sm_scale: float, max_kv_splits: int, window_size: int, "
+            "*, stream: Union[None, Stream, Device] = None) -> array"));
+  m.def("paged_prefill_attention", &mlx_serve::paged_prefill_attention,
+        "q"_a, "k_cache"_a, "v_cache"_a, "qo_indptr"_a, "kv_indptr"_a,
+        "kv_indices"_a, "prefix_lens"_a, "sm_scale"_a, "max_len_extend"_a,
+        "window_size"_a,
+        nb::kw_only(), "stream"_a = nb::none(),
+        nb::sig(
+            "def paged_prefill_attention(q: array, k_cache: array, v_cache: array, "
+            "qo_indptr: array, kv_indptr: array, kv_indices: array, "
+            "prefix_lens: array, sm_scale: float, max_len_extend: int, "
+            "window_size: int, "
+            "*, stream: Union[None, Stream, Device] = None) -> array"));
 }
