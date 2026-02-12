@@ -150,23 +150,18 @@ void PagedDecodeAttention::eval_gpu(
     compute_encoder.set_bytes(max_kv_splits_, 11);
     compute_encoder.set_bytes(window_size_, 12);
 
-    // Shared memory size
+    // Shared memory size (T is 2 bytes for both half and bfloat16)
     constexpr int BLOCK_N = 32;
     constexpr int NSG = 4;
-    // sq: BLOCK_H * DK * sizeof(half)
-    // sk: BLOCK_N * DK * sizeof(half)
-    // sv: BLOCK_N * DV * sizeof(half)
-    // ss: BLOCK_H * BLOCK_N * sizeof(float)
-    // so: BLOCK_H * DV * sizeof(float)
-    // s_emax: BLOCK_H * sizeof(float)
-    // s_esum: BLOCK_H * sizeof(float)
-    size_t shmem_size = BLOCK_H * head_dim_ * sizeof(uint16_t) +       // sq
-                        BLOCK_N * head_dim_ * sizeof(uint16_t) +       // sk
-                        BLOCK_N * head_dim_ * sizeof(uint16_t) +       // sv
-                        BLOCK_H * BLOCK_N * sizeof(float) +            // ss
-                        BLOCK_H * head_dim_ * sizeof(float) +          // so
-                        BLOCK_H * sizeof(float) +                      // s_emax
-                        BLOCK_H * sizeof(float);                       // s_esum
+    constexpr size_t T_SIZE = 2; // sizeof(half) == sizeof(bfloat16_t)
+    size_t shmem_size = BLOCK_H * head_dim_ * T_SIZE +         // sq
+                        BLOCK_N * head_dim_ * T_SIZE +         // sk
+                        BLOCK_N * head_dim_ * T_SIZE +         // sv
+                        BLOCK_H * BLOCK_N * sizeof(uint16_t) + // sp (half)
+                        BLOCK_H * BLOCK_N * sizeof(float) +    // ss
+                        BLOCK_H * head_dim_ * sizeof(float) +  // so
+                        BLOCK_H * sizeof(float) +              // s_emax
+                        BLOCK_H * sizeof(float);               // s_esum
 
     MTL::Size grid_dims(batch, head_groups, max_kv_splits_);
     MTL::Size group_dims(NSG * 32, 1, 1);

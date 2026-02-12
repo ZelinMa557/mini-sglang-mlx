@@ -138,24 +138,19 @@ void PagedPrefillAttention::eval_gpu(
   compute_encoder.set_bytes(num_kv_heads_, 10);
   compute_encoder.set_bytes(window_size_, 11);
 
-  // Shared memory size
+  // Shared memory size (T is 2 bytes for both half and bfloat16)
   constexpr int BLOCK_M = 8;
   constexpr int BLOCK_N = 32;
   constexpr int NSG = 4;
-  // sq: BLOCK_M * DK * sizeof(half)
-  // sk: BLOCK_N * DK * sizeof(half)
-  // sv: BLOCK_N * DV * sizeof(half)
-  // ss: BLOCK_M * BLOCK_N * sizeof(float)
-  // so: BLOCK_M * DV * sizeof(float)
-  // s_emax: BLOCK_M * sizeof(float)
-  // s_esum: BLOCK_M * sizeof(float)
-  size_t shmem_size = BLOCK_M * head_dim_ * sizeof(uint16_t) +    // sq
-                      BLOCK_N * head_dim_ * sizeof(uint16_t) +    // sk
-                      BLOCK_N * head_dim_ * sizeof(uint16_t) +    // sv
-                      BLOCK_M * BLOCK_N * sizeof(float) +         // ss
-                      BLOCK_M * head_dim_ * sizeof(float) +       // so
-                      BLOCK_M * sizeof(float) +                   // s_emax
-                      BLOCK_M * sizeof(float);                    // s_esum
+  constexpr size_t T_SIZE = 2; // sizeof(half) == sizeof(bfloat16_t)
+  size_t shmem_size = BLOCK_M * head_dim_ * T_SIZE +         // sq
+                      BLOCK_N * head_dim_ * T_SIZE +         // sk
+                      BLOCK_N * head_dim_ * T_SIZE +         // sv
+                      BLOCK_M * BLOCK_N * sizeof(uint16_t) + // sp (half)
+                      BLOCK_M * BLOCK_N * sizeof(float) +    // ss
+                      BLOCK_M * head_dim_ * sizeof(float) +  // so
+                      BLOCK_M * sizeof(float) +              // s_emax
+                      BLOCK_M * sizeof(float);               // s_esum
 
   int num_q_blocks = (max_len_extend_ + BLOCK_M - 1) / BLOCK_M;
 
