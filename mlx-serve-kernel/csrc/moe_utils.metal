@@ -90,13 +90,62 @@ template <typename T, int N_READS = 4>
   }
 }
 
-// clang-format off
-#define instantiate_moe_sum_reduce(type_name, type)                     \
-  instantiate_kernel("moe_sum_reduce_" #type_name, moe_sum_reduce, type) \
-  instantiate_kernel("moe_sum_reduce_with_reorder_" #type_name, moe_sum_reduce_with_reorder, type)
+// Src-first scatter broadcast for MoE prepare.
+//
+// Replaces the dst-first gather: out[i] = x[order[i] // K]
+// with a src-first broadcast:    for each token t, write x[t] to K destinations.
+//
+// Uses inv_order to find destinations: out[inv_order[t*K + k]] = x[t]
+//
+// Dispatch: threadgroups = (token_num, 1, 1)
+//           threads_per_group = (THREADS_PER_GROUP, 1, 1)
+//
+// Each threadgroup handles one src token. Threads within the group cooperatively:
+//   1. Load the entire src row into threadgroup memory (coalesced read)
+//   2. For each of K destinations, write the row out (coalesced write per dst)
+template <typename T, int N_READS = 4, int THREADS_PER_GROUP = 256>
+[[kernel]] void moe_scatter_broadcast(
+    const device T* x,
+    const device uint32_t* inv_order,
+    device T* out,
+    constant uint& topk_num,
+    constant uint& hidden_dim,
+    constant uint& x_stride_row,
+    constant uint& out_stride_row,
+    uint3 gid [[threadgroup_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]]) {
 
-instantiate_moe_sum_reduce(float16, half);
-instantiate_moe_sum_reduce(float32, float);
-instantiate_moe_sum_reduce(bfloat16, bfloat16_t);
+  const uint src_token = gid.x;
+  const uint thread_id = tid.x;
+
+  // Each thread handles a strided portion of the hidden dim
+  const device T* src_ptr = x + src_token * x_stride_row;
+  const device uint32_t* inv_ptr = inv_order + src_token * topk_num;
+
+  // For each destination (K total)
+  for (uint k = 0; k < topk_num; k++) {
+    const uint dst_row = inv_ptr[k];
+    device T* dst_ptr = out + dst_row * out_stride_row;
+
+    // Threads cooperatively copy the entire row
+    // Each thread copies N_READS elements at a time, striding by THREADS_PER_GROUP * N_READS
+    for (uint offset = thread_id * N_READS; offset < hidden_dim; offset += THREADS_PER_GROUP * N_READS) {
+      #pragma unroll
+      for (int i = 0; i < N_READS; i++) {
+        dst_ptr[offset + i] = src_ptr[offset + i];
+      }
+    }
+  }
+}
+
+// clang-format off
+#define instantiate_moe_utils(type_name, type)                     \
+  instantiate_kernel("moe_sum_reduce_" #type_name, moe_sum_reduce, type) \
+  instantiate_kernel("moe_sum_reduce_with_reorder_" #type_name, moe_sum_reduce_with_reorder, type) \
+  instantiate_kernel("moe_scatter_broadcast_" #type_name, moe_scatter_broadcast, type)
+
+instantiate_moe_utils(float16, half);
+instantiate_moe_utils(float32, float);
+instantiate_moe_utils(bfloat16, bfloat16_t);
 // clang-format on
 

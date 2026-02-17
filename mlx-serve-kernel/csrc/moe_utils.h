@@ -54,5 +54,31 @@ class MoeSumReduceWithReorder : public mx::Primitive {
   }
 };
 
+mx::array moe_scatter_broadcast(
+    const mx::array& x,
+    const mx::array& inv_order,
+    int topk_num,
+    mx::StreamOrDevice s = {});
+
+class MoeScatterBroadcast : public mx::Primitive {
+ public:
+  explicit MoeScatterBroadcast(mx::Stream stream, int topk_num)
+      : mx::Primitive(stream), topk_num_(topk_num) {};
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override { assert(false);}
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  const char* name() const override {
+    return "MoeScatterBroadcast";
+  }
+
+ private:
+  int topk_num_;
+};
+
 } // namespace mlx_serve
 

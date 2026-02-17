@@ -4,8 +4,7 @@
 #include <nanobind/stl/variant.h>
 
 #include "varlen_rope.hpp"
-#include "fused_add_rmsnorm.h"
-#include "moe_sum_reduce.h"
+#include "moe_utils.h"
 #include "store_kv_cache.h"
 #include "fast_compare_key.h"
 #include "paged_decode_attention.h"
@@ -15,11 +14,6 @@ using namespace nb::literals;
 
 NB_MODULE(_ext, m) {
   m.doc() = "Kernel library for mlx serve";
-  m.def("fused_add_rmsnorm", &mlx_serve::fused_add_rmsnorm, "x"_a, "y"_a,
-        "weight"_a, "eps"_a, nb::kw_only(), "stream"_a = nb::none(),
-        nb::sig(
-            "def fused_add_rmsnorm(x: array, y: array, weight: array, eps: "
-            "float, *, stream: Union[None, Stream, Device] = None) -> array"));
   m.def(
       "varlen_rope", &mlx_serve::varlen_rope, "x"_a, "positions"_a, "dims"_a,
       "base"_a, nb::kw_only(), "stream"_a = nb::none(),
@@ -36,6 +30,11 @@ NB_MODULE(_ext, m) {
         nb::sig(
             "def moe_sum_reduce_with_reorder(y: array, scores: array, "
             "inv_order: array, *, stream: Union[None, Stream, Device] = None) -> array"));
+  m.def("moe_scatter_broadcast", &mlx_serve::moe_scatter_broadcast,
+        "x"_a, "inv_order"_a, "topk_num"_a, nb::kw_only(), "stream"_a = nb::none(),
+        nb::sig(
+            "def moe_scatter_broadcast(x: array, inv_order: array, topk_num: int, *, "
+            "stream: Union[None, Stream, Device] = None) -> array"));
   m.def("store_kv_cache", &mlx_serve::store_kv_cache,
         "k_cache"_a, "v_cache"_a, "indices"_a, "k"_a, "v"_a,
         nb::kw_only(), "stream"_a = nb::none(),
