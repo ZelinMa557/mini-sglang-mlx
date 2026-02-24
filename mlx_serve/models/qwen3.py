@@ -1,12 +1,14 @@
+# Copyright © 2023-2024 Apple Inc.
+
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Union
+
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_serve.core import get_global_ctx
+from mlx_serve.layers.activations import swiglu
+from mlx_serve.layers.rotary_embedding import RotaryEmbedding
 from .base import BaseModelArgs
-from typing import Dict, Tuple, Optional, Union
-from dataclasses import dataclass
-from mlx_serve.engine.forward_batch import ForwardBatch
-from mlx_serve.layers.rmsnorm import RMSNorm
-from mlx_serve.layers.act import silu_mul
-
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -25,44 +27,82 @@ class ModelArgs(BaseModelArgs):
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
 
 
-class Qwen3MLP(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int):
+class Attention(nn.Module):
+    def __init__(self, args: ModelArgs, layer_id: int):
+        super().__init__()
+
+        dim = args.hidden_size
+        self.n_heads = n_heads = args.num_attention_heads
+        assert args.num_key_value_heads is not None
+        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+        head_dim = args.head_dim
+        self.qo_attn_dim = self.n_heads * head_dim
+        self.scale = head_dim**-0.5
+        self.layer_id = layer_id
+
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
+
+        self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
+        self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
+        self.rope = RotaryEmbedding(head_size=head_dim, rotary_dim=head_dim, base=args.rope_scaling)
+
+    def __call__(
+        self,
+        x: mx.array,
+    ) -> mx.array:
+        L, D = x.shape
+
+        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+
+        queries = self.q_norm(queries.reshape(L, self.n_heads, -1))
+        keys = self.k_norm(keys.reshape(L, self.n_kv_heads, -1))
+        values = values.reshape(L, self.n_kv_heads, -1)
+
+        ctx = get_global_ctx()
+        metadata = ctx.batch.attn_metadata
+        queries = self.rope(queries, metadata.positions)
+        keys = self.rope(queries, metadata.positions)
+        output = ctx.attn_backend.forward(queries, keys, values, self.layer_id, ctx.batch)
+        output = output.reshape(-1, self.qo_attn_dim)
+        return self.o_proj(output)
+
+
+class MLP(nn.Module):
+    def __init__(self, dim, hidden_dim):
         super().__init__()
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
-    def __call__(self, x: mx.array) -> mx.array:
-        gated = self.gate_proj(x)
-        uped = self.up_proj(x)
-        return self.down_proj(silu_mul(gated, uped))
+    def __call__(self, x) -> mx.array:
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
-class Qwen3Attention(nn.Module):
-    pass
-
-
-class Qwen3DecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs):
+class TransformerBlock(nn.Module):
+    def __init__(self, args: ModelArgs, layer_id: int):
         super().__init__()
         self.num_attention_heads = args.num_attention_heads
         self.hidden_size = args.hidden_size
-        self.self_attn = Qwen3Attention(args)
-        self.mlp = Qwen3MLP(args.hidden_size, args.intermediate_size)
-        self.input_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.self_attn = Attention(args, layer_id)
+        self.mlp = MLP(args.hidden_size, args.intermediate_size)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
         self.args = args
 
     def __call__(
         self,
-        hidden_states: mx.array,
-        residual: Optional[mx.array],
-        forward_batch: ForwardBatch,
-    ) -> Tuple[mx.array, mx.array]:
-        r = self.self_attn(self.input_layernorm(hidden_states, residual), forward_batch)
-        h = hidden_states + r
+        x: mx.array,
+    ) -> mx.array:
+        r = self.self_attn(self.input_layernorm(x))
+        h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
-        return h, r
+        out = h + r
+        return out
 
 
 class Qwen3Model(nn.Module):
@@ -74,23 +114,22 @@ class Qwen3Model(nn.Module):
         assert self.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            Qwen3DecoderLayer(args=args) for _ in range(args.num_hidden_layers)
+            TransformerBlock(args=args, layer_id=i) for i in range(args.num_hidden_layers)
         ]
-        self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,
         inputs: mx.array,
-        forward_batch: ForwardBatch,
     ):
-        hidden_states = self.embed_tokens(inputs)
-        residual = None
+        h = self.embed_tokens(inputs)
         for layer in self.layers:
-            hidden_states, residual = layer(hidden_states, residual, forward_batch)
+            h = layer(h)
 
-        return self.norm(hidden_states, residual)
+        return self.norm(h)
 
-class Qwen3ForCausalLM(nn.Module):
+
+class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -101,11 +140,8 @@ class Qwen3ForCausalLM(nn.Module):
 
     def __call__(
         self,
-        inputs: mx.array,
-        cache=None,
-        input_embeddings: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache, input_embeddings)
+        out = self.model(get_global_ctx().batch.input_ids)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:

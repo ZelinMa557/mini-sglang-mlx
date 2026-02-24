@@ -17,7 +17,6 @@ mx::array paged_decode_attention(
     const mx::array& num_kv_splits,
     float sm_scale,
     int max_kv_splits,
-    int window_size,
     mx::StreamOrDevice s = {});
 
 class PagedDecodeAttention : public mx::Primitive {
@@ -26,14 +25,12 @@ class PagedDecodeAttention : public mx::Primitive {
       mx::Stream stream,
       float sm_scale,
       int max_kv_splits,
-      int window_size,
       int num_q_heads,
       int num_kv_heads,
       int head_dim)
       : mx::Primitive(stream),
         sm_scale_(sm_scale),
         max_kv_splits_(max_kv_splits),
-        window_size_(window_size),
         num_q_heads_(num_q_heads),
         num_kv_heads_(num_kv_heads),
         head_dim_(head_dim) {}
@@ -54,7 +51,6 @@ class PagedDecodeAttention : public mx::Primitive {
  private:
   float sm_scale_;
   int max_kv_splits_;
-  int window_size_;
   int num_q_heads_;
   int num_kv_heads_;
   int head_dim_;

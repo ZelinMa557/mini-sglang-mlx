@@ -34,11 +34,6 @@ class BaseKVCache(ABC):
     def num_layers(self) -> int: ...
 
 
-class KVCacheLayout(enum.Enum):
-    LayerFirst = enum.auto()
-    PageFirst = enum.auto()
-
-
 @dataclass(frozen=True)
 class BaseCacheHandle(ABC):
     cached_len: int

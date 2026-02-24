@@ -33,7 +33,6 @@ template <
     constant float& sm_scale             [[buffer(8)]],
     constant int& num_q_heads            [[buffer(9)]],
     constant int& num_kv_heads           [[buffer(10)]],
-    constant int& window_size            [[buffer(11)]],
     threadgroup char* shmem_raw          [[threadgroup(0)]],
     uint3 tgpig   [[threadgroup_position_in_grid]],
     ushort tiisg  [[thread_index_in_simdgroup]],
@@ -157,7 +156,7 @@ template <
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- Scale, causal mask, sliding window mask ----
+    // ---- Scale + causal mask ----
     for (int i = tid; i < BLOCK_M * BLOCK_N; i += total_threads) {
       int m = i / BLOCK_N;
       int n = i % BLOCK_N;
@@ -175,16 +174,6 @@ template <
           int q_offset = q_block_start + m;
           if (q_offset < k_extend_offset) {
             is_valid = false;
-          }
-        }
-
-        // Sliding window mask
-        if (is_valid && window_size > 0) {
-          if (kv_pos != 0) {
-            int q_abs = cur_prefix_len + q_block_start + m;
-            if (kv_pos + window_size <= q_abs) {
-              is_valid = false;
-            }
           }
         }
       }

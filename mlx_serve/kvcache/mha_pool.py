@@ -20,26 +20,10 @@ class MHAKVCache(BaseKVCache):
         head_dim: int,
         num_pages: int,
         dtype: mx.Dtype,
-        kv_layout: KVCacheLayout,
-        device: None = None,
     ):
-        del device  # MLX runs on Apple Silicon, no explicit device
-        match kv_layout:
-            case KVCacheLayout.PageFirst:
-                kv_buffer = mx.empty(
-                    (2, num_pages, num_layers, num_kv_heads, head_dim),
-                    dtype=dtype,
-                )
-                kv_buffer = mx.transpose(kv_buffer, (0, 2, 1, 3, 4))
-            case KVCacheLayout.LayerFirst:
-                kv_buffer = mx.empty(
-                    (2, num_layers, num_pages, num_kv_heads, head_dim),
-                    dtype=dtype,
-                )
-            case _:
-                raise ValueError(f"Unsupported kv_layout: {kv_layout}")
-        self._kv_buffer = mx.reshape(
-            kv_buffer, (2, num_layers, num_pages, 1, num_kv_heads, head_dim)
+        self._kv_buffer = mx.empty(
+            (2, num_layers, num_pages, num_kv_heads, head_dim),
+            dtype=dtype,
         )
         self._num_layers = num_layers
         self._k_buffer = self._kv_buffer[0]

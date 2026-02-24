@@ -9,10 +9,8 @@ Implement a high-performance **paged decode attention** kernel targeting Apple S
 - **GQA-centric**: Multiple Q heads share one KV head (e.g., 4:1 or 8:1). MHA is treated as GQA with group_num=1
 - **Flash Decoding**: Split long KV sequences across multiple threadgroups for parallelism
 - **Query head packing**: Pack multiple Q heads into one threadgroup for KV reuse + simdgroup matmul
-- **Sliding window attention**: Support limiting attention to the last `window_size` tokens
-- **Attention sink**: Support always attending to the first token (sink token) even with sliding window
 - Data types: `float16` and `bfloat16`
-- Head dimensions: 64, 128, 512
+- Head dimensions: 128
 
 ## 2. Data Layout & KV Cache Format
 
@@ -27,7 +25,6 @@ Implement a high-performance **paged decode attention** kernel targeting Apple S
 | `kv_indices` | `(total_kv_tokens,)` | int32 | Page indices for each KV token |
 | `num_kv_splits` | `(batch,)` | int32 | Per-request number of KV splits |
 | `sm_scale` | scalar | float | Typically `1/sqrt(head_dim)` |
-| `window_size` | scalar | int | Sliding window size (-1 = disabled) |
 
 ### Outputs
 

@@ -20,7 +20,6 @@ namespace mlx_serve {
 /// prefix_lens:  (batch,)      prefix length per sequence
 ///
 /// Causal masking is always applied for the extend region.
-/// Sliding window + attention sink are optional.
 mx::array paged_prefill_attention(
     const mx::array& q,
     const mx::array& k_cache,
@@ -31,7 +30,6 @@ mx::array paged_prefill_attention(
     const mx::array& prefix_lens,
     float sm_scale,
     int max_len_extend,
-    int window_size,
     mx::StreamOrDevice s = {});
 
 class PagedPrefillAttention : public mx::Primitive {
@@ -40,7 +38,6 @@ class PagedPrefillAttention : public mx::Primitive {
       mx::Stream stream,
       float sm_scale,
       int max_len_extend,
-      int window_size,
       int num_q_heads,
       int num_kv_heads,
       int head_dim,
@@ -48,7 +45,6 @@ class PagedPrefillAttention : public mx::Primitive {
       : mx::Primitive(stream),
         sm_scale_(sm_scale),
         max_len_extend_(max_len_extend),
-        window_size_(window_size),
         num_q_heads_(num_q_heads),
         num_kv_heads_(num_kv_heads),
         head_dim_(head_dim),
@@ -70,7 +66,6 @@ class PagedPrefillAttention : public mx::Primitive {
  private:
   float sm_scale_;
   int max_len_extend_;
-  int window_size_;
   int num_q_heads_;
   int num_kv_heads_;
   int head_dim_;

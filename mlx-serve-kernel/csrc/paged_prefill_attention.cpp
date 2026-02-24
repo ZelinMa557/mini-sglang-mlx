@@ -21,7 +21,6 @@ mx::array paged_prefill_attention(
     const mx::array& prefix_lens,
     float sm_scale,
     int max_len_extend,
-    int window_size,
     mx::StreamOrDevice s_) {
   if (q.ndim() != 3) {
     throw std::runtime_error(
@@ -72,7 +71,7 @@ mx::array paged_prefill_attention(
       {total_q_tokens, num_q_heads, head_dim},
       q.dtype(),
       std::make_shared<PagedPrefillAttention>(
-          s, sm_scale, max_len_extend, window_size, num_q_heads, num_kv_heads,
+          s, sm_scale, max_len_extend, num_q_heads, num_kv_heads,
           head_dim, total_q_tokens),
       {q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, prefix_lens});
 }
@@ -136,7 +135,6 @@ void PagedPrefillAttention::eval_gpu(
   compute_encoder.set_bytes(sm_scale_, 8);
   compute_encoder.set_bytes(num_q_heads_, 9);
   compute_encoder.set_bytes(num_kv_heads_, 10);
-  compute_encoder.set_bytes(window_size_, 11);
 
   // Shared memory size (T is 2 bytes for both half and bfloat16)
   constexpr int BLOCK_M = 8;

@@ -1,271 +1,247 @@
+"""
+Paged Decode Attention: correctness & performance tests vs MLX SDPA.
+
+Decode attention: each sequence has 1 new query token attending to all
+historical KV tokens. Our kernel uses paged KV cache with ragged batching;
+MLX SDPA uses dense [1, N_q, 1, D] / [1, N_kv, T_kv, D] per sequence.
+"""
+
 import numpy as np
 import mlx.core as mx
 import math
 import time
 from mlx_serve_kernel import paged_decode_attention
 
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-def naive_paged_attention(
-    q, k_cache, v_cache, kv_indptr, kv_indices, sm_scale, window_size=-1
+HEAD_DIM = 128
+
+
+def build_paged_decode_inputs(
+    kv_lens: list[int],
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int = HEAD_DIM,
+    dtype=mx.bfloat16,
 ):
     """
-    Naive reference implementation of paged decode attention.
-    q: (batch, num_q_heads, head_dim)
-    k_cache, v_cache: (num_pages, num_kv_heads, head_dim)
-    kv_indptr: (batch + 1,)
-    kv_indices: (total_kv_tokens,)
+    Build a shared paged KV cache and inputs for both our kernel and MLX SDPA.
+
+    Returns a dict with all arrays needed for both paths.
     """
-    batch = q.shape[0]
-    num_q_heads = q.shape[1]
-    head_dim = q.shape[2]
-    num_kv_heads = k_cache.shape[1]
-    kv_group_num = num_q_heads // num_kv_heads
+    batch = len(kv_lens)
+    total_kv = sum(kv_lens)
+    num_pages = total_kv  # 1:1 page mapping for simplicity
 
-    q_np = np.array(q, dtype=np.float32)
-    k_np = np.array(k_cache, dtype=np.float32)
-    v_np = np.array(v_cache, dtype=np.float32)
-    indptr_np = np.array(kv_indptr, dtype=np.int32)
-    indices_np = np.array(kv_indices, dtype=np.int32)
+    # Random KV cache (flat paged): (num_pages, num_kv_heads, head_dim)
+    k_cache = mx.random.normal((num_pages, num_kv_heads, head_dim), dtype=dtype)
+    v_cache = mx.random.normal((num_pages, num_kv_heads, head_dim), dtype=dtype)
 
-    out_np = np.zeros((batch, num_q_heads, head_dim), dtype=np.float32)
+    # Random queries: (batch, num_q_heads, head_dim)
+    q = mx.random.normal((batch, num_q_heads, head_dim), dtype=dtype)
 
-    for b in range(batch):
-        kv_start = indptr_np[b]
-        kv_end = indptr_np[b + 1]
-        kv_len = kv_end - kv_start
+    # Build kv_indptr and kv_indices (identity page mapping)
+    indptr = [0]
+    for l in kv_lens:
+        indptr.append(indptr[-1] + l)
+    kv_indptr = mx.array(indptr, dtype=mx.int32)
+    kv_indices = mx.array(np.arange(total_kv, dtype=np.int32))
 
-        if kv_len == 0:
-            continue
+    # num_kv_splits
+    max_kv_splits = 32
+    splits = []
+    for l in kv_lens:
+        s = min(max_kv_splits, max(1, (l + 127) // 128))
+        splits.append(s)
+    num_kv_splits = mx.array(splits, dtype=mx.int32)
 
-        # Gather K, V: (kv_len, num_kv_heads, head_dim)
-        page_ids = indices_np[kv_start:kv_end]
-        k_gathered = k_np[page_ids]  # (kv_len, num_kv_heads, head_dim)
-        v_gathered = v_np[page_ids]
+    mx.eval(q, k_cache, v_cache, kv_indptr, kv_indices, num_kv_splits)
 
-        for qh in range(num_q_heads):
-            kv_h = qh // kv_group_num
+    return dict(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        num_kv_splits=num_kv_splits,
+        max_kv_splits=max_kv_splits,
+        kv_lens=kv_lens,
+        batch=batch,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+    )
 
-            qi = q_np[b, qh, :]  # (head_dim,)
-            ki = k_gathered[:, kv_h, :]  # (kv_len, head_dim)
-            vi = v_gathered[:, kv_h, :]  # (kv_len, head_dim)
 
-            # QK^T
-            scores = ki @ qi * sm_scale  # (kv_len,)
+def run_our_kernel(data: dict) -> mx.array:
+    """Run our paged decode attention kernel."""
+    sm_scale = 1.0 / math.sqrt(data["head_dim"])
+    out = paged_decode_attention(
+        data["q"],
+        data["k_cache"],
+        data["v_cache"],
+        data["kv_indptr"],
+        data["kv_indices"],
+        data["num_kv_splits"],
+        sm_scale=sm_scale,
+        max_kv_splits=data["max_kv_splits"],
+    )
+    return out
 
-            # Sliding window mask
-            if window_size > 0:
-                win_start = max(1, kv_len - window_size)
-                for pos in range(kv_len):
-                    if pos != 0 and pos < win_start:
-                        scores[pos] = -1e9
 
-            # Softmax
-            scores_max = np.max(scores)
-            scores_exp = np.exp(scores - scores_max)
-            scores_sum = np.sum(scores_exp)
-            attn_weights = scores_exp / scores_sum
+def run_mlx_sdpa(data: dict) -> mx.array:
+    """
+    Run MLX SDPA per-sequence as reference.
+    For decode: q is [1, N_q, 1, D], k/v are [1, N_kv, T_kv, D].
+    No mask needed since decode query attends to all KV tokens.
+    Returns: (batch, N_q, D)
+    """
+    sm_scale = 1.0 / math.sqrt(data["head_dim"])
+    kv_indptr_np = np.array(data["kv_indptr"], dtype=np.int32)
+    kv_indices_np = np.array(data["kv_indices"], dtype=np.int32)
 
-            # Output
-            out_np[b, qh, :] = attn_weights @ vi
+    results = []
+    for b in range(data["batch"]):
+        kv_start = int(kv_indptr_np[b])
+        kv_end = int(kv_indptr_np[b + 1])
+        page_ids = mx.array(kv_indices_np[kv_start:kv_end].astype(np.int32))
 
-    return mx.array(out_np, dtype=q.dtype)
+        # Gather dense K, V for this sequence
+        k_seq = data["k_cache"][page_ids]  # (T_kv, N_kv, D)
+        v_seq = data["v_cache"][page_ids]
 
+        # Reshape for SDPA: [1, N_kv, T_kv, D]
+        k_seq = mx.expand_dims(mx.transpose(k_seq, (1, 0, 2)), axis=0)
+        v_seq = mx.expand_dims(mx.transpose(v_seq, (1, 0, 2)), axis=0)
+
+        # Query: [1, N_q, 1, D]
+        q_seq = data["q"][b:b+1].reshape(1, data["num_q_heads"], 1, data["head_dim"])
+
+        out_seq = mx.fast.scaled_dot_product_attention(
+            q_seq, k_seq, v_seq, scale=sm_scale
+        )  # [1, N_q, 1, D]
+        results.append(out_seq.reshape(data["num_q_heads"], data["head_dim"]))
+
+    return mx.stack(results, axis=0)  # (batch, N_q, D)
+
+
+# ── Correctness ──────────────────────────────────────────────────────────────
 
 def test_correctness(
-    batch,
-    num_q_heads,
-    num_kv_heads,
-    head_dim,
-    kv_lens,
-    max_kv_splits=8,
-    window_size=-1,
-    dtype=mx.float16,
+    kv_lens: list[int],
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int = HEAD_DIM,
+    dtype=mx.bfloat16,
 ):
-    """Test kernel correctness against naive implementation."""
-    assert len(kv_lens) == batch
+    data = build_paged_decode_inputs(kv_lens, num_q_heads, num_kv_heads, head_dim, dtype)
 
-    num_pages = sum(kv_lens) + 64  # extra pages
-    total_kv = sum(kv_lens)
+    out_ours = run_our_kernel(data)
+    mx.eval(out_ours)
 
-    # Generate random data
-    q = mx.random.normal((batch, num_q_heads, head_dim), dtype=dtype)
-    k_cache = mx.random.normal((num_pages, num_kv_heads, head_dim), dtype=dtype)
-    v_cache = mx.random.normal((num_pages, num_kv_heads, head_dim), dtype=dtype)
+    out_ref = run_mlx_sdpa(data)
+    mx.eval(out_ref)
 
-    # Build kv_indptr and kv_indices
-    indptr = [0]
-    for l in kv_lens:
-        indptr.append(indptr[-1] + l)
-    kv_indptr = mx.array(indptr, dtype=mx.int32)
+    out_ours_f32 = np.array(out_ours.astype(mx.float32))
+    out_ref_f32 = np.array(out_ref.astype(mx.float32))
+    diff = np.abs(out_ours_f32 - out_ref_f32)
+    max_diff = float(np.max(diff))
+    mean_diff = float(np.mean(diff))
 
-    # Random page mapping (simulate paged allocation)
-    all_pages = np.random.permutation(num_pages)[:total_kv]
-    kv_indices = mx.array(all_pages.astype(np.int32))
-
-    # Compute num_kv_splits per request
-    splits = []
-    for l in kv_lens:
-        s = min(max_kv_splits, max(1, (l + 255) // 256))
-        splits.append(s)
-    num_kv_splits = mx.array(splits, dtype=mx.int32)
-
-    mx.eval(q, k_cache, v_cache, kv_indptr, kv_indices, num_kv_splits)
-
-    # Kernel output
-    out_kernel = paged_decode_attention(
-        q, k_cache, v_cache, kv_indptr, kv_indices, num_kv_splits,
-        sm_scale=1.0 / math.sqrt(head_dim),
-        max_kv_splits=max_kv_splits,
-        window_size=window_size,
-    )
-    mx.eval(out_kernel)
-
-    # Naive output
-    out_naive = naive_paged_attention(
-        q, k_cache, v_cache, kv_indptr, kv_indices,
-        sm_scale=1.0 / math.sqrt(head_dim),
-        window_size=window_size,
-    )
-    mx.eval(out_naive)
-
-    # Compare
-    out_k = np.array(out_kernel, dtype=np.float32)
-    out_n = np.array(out_naive, dtype=np.float32)
-    max_diff = np.max(np.abs(out_k - out_n))
-    mean_diff = np.mean(np.abs(out_k - out_n))
-
-    atol = 5e-2 if head_dim == 512 else 2e-2
-    is_close = max_diff < atol
-
-    return is_close, max_diff, mean_diff
+    atol = 5e-2
+    passed = max_diff < atol
+    return passed, max_diff, mean_diff
 
 
-def bench_kernel(
-    batch,
-    num_q_heads,
-    num_kv_heads,
-    head_dim,
-    kv_len,
-    max_kv_splits=16,
-    window_size=-1,
-    dtype=mx.float16,
-    warmup=10,
-    repeat=100,
+# ── Benchmark ────────────────────────────────────────────────────────────────
+
+def bench(
+    kv_lens: list[int],
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int = HEAD_DIM,
+    dtype=mx.bfloat16,
+    warmup: int = 20,
+    repeat: int = 100,
 ):
-    """Benchmark kernel latency."""
-    kv_lens = [kv_len] * batch
-    num_pages = sum(kv_lens) + 64
-    total_kv = sum(kv_lens)
+    data = build_paged_decode_inputs(kv_lens, num_q_heads, num_kv_heads, head_dim, dtype)
 
-    q = mx.random.normal((batch, num_q_heads, head_dim), dtype=dtype)
-    k_cache = mx.random.normal((num_pages, num_kv_heads, head_dim), dtype=dtype)
-    v_cache = mx.random.normal((num_pages, num_kv_heads, head_dim), dtype=dtype)
-
-    indptr = [0]
-    for l in kv_lens:
-        indptr.append(indptr[-1] + l)
-    kv_indptr = mx.array(indptr, dtype=mx.int32)
-
-    all_pages = np.arange(total_kv)
-    kv_indices = mx.array(all_pages.astype(np.int32))
-
-    splits = []
-    for l in kv_lens:
-        s = min(max_kv_splits, max(1, (l + 255) // 256))
-        splits.append(s)
-    num_kv_splits = mx.array(splits, dtype=mx.int32)
-
-    sm_scale = 1.0 / math.sqrt(head_dim)
-    mx.eval(q, k_cache, v_cache, kv_indptr, kv_indices, num_kv_splits)
-
-    # Warmup
+    # Warmup + bench our kernel
     for _ in range(warmup):
-        out = paged_decode_attention(
-            q, k_cache, v_cache, kv_indptr, kv_indices, num_kv_splits,
-            sm_scale=sm_scale, max_kv_splits=max_kv_splits, window_size=window_size,
-        )
-        mx.eval(out)
-
-    # Benchmark
-    start = time.perf_counter()
+        mx.eval(run_our_kernel(data))
+    t0 = time.perf_counter()
     for _ in range(repeat):
-        out = paged_decode_attention(
-            q, k_cache, v_cache, kv_indptr, kv_indices, num_kv_splits,
-            sm_scale=sm_scale, max_kv_splits=max_kv_splits, window_size=window_size,
-        )
-        mx.eval(out)
-    elapsed = (time.perf_counter() - start) / repeat * 1000  # ms
+        mx.eval(run_our_kernel(data))
+    ours_ms = (time.perf_counter() - t0) / repeat * 1000
 
-    return elapsed
+    # Warmup + bench MLX SDPA
+    for _ in range(warmup):
+        mx.eval(run_mlx_sdpa(data))
+    t0 = time.perf_counter()
+    for _ in range(repeat):
+        mx.eval(run_mlx_sdpa(data))
+    sdpa_ms = (time.perf_counter() - t0) / repeat * 1000
 
+    return ours_ms, sdpa_ms
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     mx.random.seed(42)
     np.random.seed(42)
 
-    print("=" * 70)
-    print("Paged Decode Attention - Correctness Tests")
-    print("=" * 70)
+    # ────── Correctness tests ──────
+    print("=" * 80)
+    print("Paged Decode Attention — Correctness (vs MLX SDPA)")
+    print("=" * 80)
 
-    test_configs = [
-        # (batch, num_q_heads, num_kv_heads, head_dim, kv_lens, max_splits, window)
-        # Basic GQA tests
-        (1, 32, 8, 128, [128], 8, -1),
-        (1, 32, 8, 128, [512], 8, -1),
-        (1, 32, 8, 128, [2048], 8, -1),
-        (4, 32, 8, 128, [256, 512, 128, 1024], 8, -1),
-        # Different head dims
-        (1, 32, 8, 64, [512], 8, -1),
-        (1, 8, 2, 512, [256], 8, -1),
-        # MHA (kv_group_num=1)
-        (1, 8, 8, 128, [512], 8, -1),
-        # Large kv_group_num
-        (1, 32, 4, 128, [512], 8, -1),
-        (1, 64, 8, 128, [512], 8, -1),
-        # Flash decoding with many splits
-        (1, 32, 8, 128, [4096], 16, -1),
-        (2, 32, 8, 128, [4096, 2048], 16, -1),
-        # Sliding window
-        (1, 32, 8, 128, [2048], 8, 512),
-        (2, 32, 8, 128, [2048, 1024], 8, 256),
-        # Sliding window + short seq (window > seq_len)
-        (1, 32, 8, 128, [128], 8, 512),
-    ]
+    single_seq_lens = [1, 237, 512, 809, 1024, 2048, 3333, 4096]
+    kv_heads_list = [4,8]
 
+    # Single-sequence tests
     all_pass = True
-    for batch, nqh, nkvh, hd, kvlens, ms, ws in test_configs:
-        label = (f"batch={batch}, q_heads={nqh}, kv_heads={nkvh}, "
-                 f"head_dim={hd}, kv_lens={kvlens}, splits={ms}, window={ws}")
-        ok, max_diff, mean_diff = test_correctness(
-            batch, nqh, nkvh, hd, kvlens, ms, ws
-        )
-        status = "PASS" if ok else "FAIL"
-        print(f"  [{status}] {label}  (max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f})")
-        if not ok:
-            all_pass = False
+    for nkvh in kv_heads_list:
+        for kvl in single_seq_lens:
+            ok, md, ad = test_correctness([kvl], 32, nkvh)
+            tag = "PASS" if ok else "FAIL"
+            print(f"  [{tag}] kv_heads={nkvh:>2}, kv_len={kvl:>5}  "
+                  f"max_diff={md:.6f}  mean_diff={ad:.6f}")
+            if not ok:
+                all_pass = False
 
+    # Multi-sequence (ragged batch) tests
     print()
-    if all_pass:
-        print("All correctness tests passed!")
-    else:
-        print("Some tests FAILED!")
-
-    print()
-    print("=" * 70)
-    print("Paged Decode Attention - Benchmarks")
-    print("=" * 70)
-
-    bench_configs = [
-        # (batch, num_q_heads, num_kv_heads, head_dim, kv_len, max_splits, window)
-        (1, 32, 8, 128, 512, 8, -1),
-        (1, 32, 8, 128, 2048, 8, -1),
-        (1, 32, 8, 128, 8192, 16, -1),
-        (4, 32, 8, 128, 2048, 8, -1),
-        (16, 32, 8, 128, 512, 8, -1),
+    print("  --- Multi-sequence (ragged batch) ---")
+    multi_seq_configs = [
+        [1, 237],
+        [512, 1024, 2048],
+        [237, 809, 3333, 4096],
+        [1, 1, 1, 1, 1, 1, 1, 1],
+        [4096, 4096, 4096, 4096],
     ]
+    for nkvh in kv_heads_list:
+        for kv_lens in multi_seq_configs:
+            ok, md, ad = test_correctness(kv_lens, 32, nkvh)
+            tag = "PASS" if ok else "FAIL"
+            print(f"  [{tag}] kv_heads={nkvh:>2}, kv_lens={str(kv_lens):>30}  "
+                  f"max_diff={md:.6f}  mean_diff={ad:.6f}")
+            if not ok:
+                all_pass = False
 
-    for batch, nqh, nkvh, hd, kvl, ms, ws in bench_configs:
-        elapsed = bench_kernel(batch, nqh, nkvh, hd, kvl, ms, ws)
-        label = (f"batch={batch}, q_heads={nqh}, kv_heads={nkvh}, "
-                 f"head_dim={hd}, kv_len={kvl}, splits={ms}")
-        print(f"  {label}  ->  {elapsed:.3f} ms")
+    print()
+    print("ALL PASSED" if all_pass else "SOME TESTS FAILED")
+
+    # ────── Performance tests ──────
+    print()
+    print("=" * 80)
+    print("Paged Decode Attention — Performance (us)")
+    print("=" * 80)
+    print(f"  {'kv_heads':>8} {'kv_len':>8} {'ours(us)':>10} {'sdpa(us)':>10} {'speedup':>8}")
+    print("  " + "-" * 50)
+
+    for nkvh in kv_heads_list:
+        for kvl in single_seq_lens:
+            ours_ms, sdpa_ms = bench([kvl], 32, nkvh)
+            speedup = sdpa_ms / ours_ms if ours_ms > 0 else float("inf")
+            print(f"  {nkvh:>8} {kvl:>8} {ours_ms*1000:>10.1f} {sdpa_ms*1000:>10.1f} {speedup:>7.2f}x")

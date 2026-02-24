@@ -20,7 +20,6 @@ mx::array paged_decode_attention(
     const mx::array& num_kv_splits,
     float sm_scale,
     int max_kv_splits,
-    int window_size,
     mx::StreamOrDevice s_) {
   if (q.ndim() != 3) {
     throw std::runtime_error(
@@ -43,9 +42,9 @@ mx::array paged_decode_attention(
   int head_dim = q.shape(2);
   int num_kv_heads = k_cache.shape(1);
 
-  if (head_dim != 64 && head_dim != 128 && head_dim != 512) {
+  if (head_dim != 128 && head_dim != 576) {
     throw std::runtime_error(
-        "paged_decode_attention: head_dim must be 64, 128, or 512");
+        "paged_decode_attention: head_dim must be 128, or 576");
   }
   if (num_q_heads % num_kv_heads != 0) {
     throw std::runtime_error(
@@ -63,7 +62,7 @@ mx::array paged_decode_attention(
       {batch, num_q_heads, head_dim},
       q.dtype(),
       std::make_shared<PagedDecodeAttention>(
-          s, sm_scale, max_kv_splits, window_size, num_q_heads, num_kv_heads,
+          s, sm_scale, max_kv_splits, num_q_heads, num_kv_heads,
           head_dim),
       {q, k_cache, v_cache, kv_indptr, kv_indices, num_kv_splits});
 }
@@ -142,13 +141,12 @@ void PagedDecodeAttention::eval_gpu(
     compute_encoder.set_input_array(kv_indptr, 3);
     compute_encoder.set_input_array(kv_indices, 4);
     compute_encoder.set_input_array(num_kv_splits_arr, 5);
-    compute_encoder.set_input_array(att_out, 6);
-    compute_encoder.set_input_array(att_lse, 7);
+    compute_encoder.set_output_array(att_out, 6);
+    compute_encoder.set_output_array(att_lse, 7);
     compute_encoder.set_bytes(sm_scale_, 8);
     compute_encoder.set_bytes(num_q_heads_, 9);
     compute_encoder.set_bytes(num_kv_heads_, 10);
     compute_encoder.set_bytes(max_kv_splits_, 11);
-    compute_encoder.set_bytes(window_size_, 12);
 
     // Shared memory size (T is 2 bytes for both half and bfloat16)
     constexpr int BLOCK_N = 32;

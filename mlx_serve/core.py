@@ -7,8 +7,7 @@ from typing import TYPE_CHECKING, List, Literal
 import mlx.core as mx
 
 if TYPE_CHECKING:
-    from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
-
+    from mlx_serve.attention import AttnBackend, BaseAttnMetadata
     from mlx_serve.kvcache import BaseCacheHandle
 
 
@@ -97,7 +96,7 @@ class Batch:
 @dataclass
 class Context:
     page_size: int
-    attn_backend: BaseAttnBackend
+    attn_backend: AttnBackend
     _batch: Batch | None = field(default=None, init=False)
 
     @property

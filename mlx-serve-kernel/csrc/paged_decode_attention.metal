@@ -34,7 +34,6 @@ template <
     constant int& num_q_heads         [[buffer(9)]],
     constant int& num_kv_heads        [[buffer(10)]],
     constant int& max_kv_splits       [[buffer(11)]],
-    constant int& window_size         [[buffer(12)]],
     threadgroup char* shmem_raw       [[threadgroup(0)]],
     uint3 tgpig   [[threadgroup_position_in_grid]],
     ushort tiisg  [[thread_index_in_simdgroup]],
@@ -70,9 +69,6 @@ template <
   const int split_kv_end = min(split_kv_start + kv_len_per_split, cur_batch_seq_len);
 
   if (split_kv_start >= split_kv_end) return;
-
-  // ---- Sliding window boundaries ----
-  const int win_start = (window_size > 0) ? max(1, cur_batch_seq_len - window_size) : 0;
 
   // ---- Shared memory layout ----
   // sq:  BLOCK_H * DK elements of T
@@ -166,19 +162,13 @@ template <
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- Scale + sliding window mask ----
+    // ---- Scale + validity mask ----
     for (int i = tid; i < BLOCK_H * BLOCK_N; i += total_threads) {
       int h = i / BLOCK_N;
       int n = i % BLOCK_N;
 
       float val = ss[h * BLOCK_N + n] * sm_scale;
-
-      int token_pos = block_start + n;
       bool is_valid = (n < valid_n) && (h < actual_heads);
-
-      if (is_valid && window_size > 0) {
-        is_valid = (token_pos >= win_start) || (token_pos == 0);
-      }
 
       ss[h * BLOCK_N + n] = is_valid ? val : -HUGE_VALF;
     }
@@ -384,19 +374,12 @@ template <typename T, short DV>
     paged_decode_attention_stage2, type, dv)
 
 // float16
-instantiate_stage1(float16, half, 64, 64)
 instantiate_stage1(float16, half, 128, 128)
-instantiate_stage1(float16, half, 512, 512)
 
-instantiate_stage2(float16, half, 64)
 instantiate_stage2(float16, half, 128)
-instantiate_stage2(float16, half, 512)
 
 // bfloat16
-instantiate_stage1(bfloat16, bfloat16_t, 64, 64)
 instantiate_stage1(bfloat16, bfloat16_t, 128, 128)
-instantiate_stage1(bfloat16, bfloat16_t, 512, 512)
-
-instantiate_stage2(bfloat16, bfloat16_t, 64)
+instantiate_stage1(bfloat16, bfloat16_t, 576, 576)
 instantiate_stage2(bfloat16, bfloat16_t, 128)
-instantiate_stage2(bfloat16, bfloat16_t, 512)
+instantiate_stage2(bfloat16, bfloat16_t, 576)
