@@ -21,8 +21,7 @@ from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
 from .table import TableManager
 
-if TYPE_CHECKING:
-    from mlx_serve.engine import BatchSamplingArgs, ForwardOutput
+from mlx_serve.engine import BatchSamplingArgs, ForwardOutput
 
 
 logger = init_logger(__name__)
