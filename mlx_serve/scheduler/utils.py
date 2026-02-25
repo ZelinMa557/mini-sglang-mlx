@@ -3,10 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
-import torch
+import mlx.core as mx
 
 if TYPE_CHECKING:
-    from minisgl.core import SamplingParams
+    from mlx_serve.core import SamplingParams
 
     from .prefill import ChunkedReq
 
@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 @dataclass
 class PendingReq:
     uid: int
-    input_ids: torch.Tensor
+    input_ids: mx.array
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
 
@@ -30,4 +30,4 @@ class PendingReq:
 @dataclass
 class ScheduleResult:
     reqs: List[PendingReq]
-    output_indices: List[torch.Tensor]
+    output_indices: List[mx.array]

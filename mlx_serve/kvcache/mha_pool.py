@@ -4,7 +4,7 @@ import mlx.core as mx
 
 from mlx_serve_kernel import store_kv_cache
 
-from .base import BaseKVCache, KVCacheLayout
+from .base import BaseKVCache
 
 
 class MHAKVCache(BaseKVCache):

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterable, Set
 
-from minisgl.core import Batch, Req
+from mlx_serve.core import Batch, Req
 
 
 @dataclass

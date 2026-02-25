@@ -3,15 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
-import torch
-from minisgl.core import Batch, Req
-from minisgl.utils import init_logger
+import mlx.core as mx
+from mlx_serve.core import Batch, Req
+from mlx_serve.utils import init_logger
 
 from .utils import PendingReq
 
 if TYPE_CHECKING:
-    from minisgl.kvcache import BaseCacheHandle
-    from minisgl.message import UserMsg
+    from mlx_serve.kvcache import BaseCacheHandle
+    from mlx_serve.message import UserMsg
 
     from .cache import CacheManager
     from .decode import DecodeManager
@@ -21,7 +21,7 @@ logger = init_logger(__name__)
 
 
 class ChunkedReq(Req):
-    def append_host(self, next_token: torch.Tensor) -> None:
+    def append_host(self, next_token: mx.array) -> None:
         raise NotImplementedError("ChunkedReq should be sampled")
 
     def can_decode(self) -> bool:
@@ -55,8 +55,8 @@ class PrefillAdder:
         if cached_len > 0:  # NOTE: set the cached part
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]
             page_entry = self.table_manager.page_table[table_idx][:cached_len]
-            device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
-            page_entry.copy_(match_indices)
+            device_ids[:] = req.input_ids[:cached_len]
+            page_entry[:] = match_indices
 
         return handle, table_idx
 
@@ -76,7 +76,7 @@ class PrefillAdder:
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx][_slice]
-        device_ids.copy_(pending_req.input_ids[_slice].pin_memory(), non_blocking=True)
+        device_ids[:] = pending_req.input_ids[_slice]
         return CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,

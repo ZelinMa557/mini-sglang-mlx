@@ -12,7 +12,6 @@ import mlx.nn as nn
 from huggingface_hub import snapshot_download
 
 from .base import BaseModelArgs
-from .config import ModelConfig, RotaryConfig
 
 logger = logging.getLogger(__name__)
 
@@ -164,8 +163,6 @@ def create_model(
 
 __all__ = [
     "BaseModelArgs",
-    "ModelConfig",
-    "RotaryConfig",
     "create_model",
     "load_model",
     "load_config",

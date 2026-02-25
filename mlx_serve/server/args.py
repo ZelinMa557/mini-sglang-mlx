@@ -5,10 +5,9 @@ import os
 from dataclasses import dataclass
 from typing import List, Tuple
 
-import torch
-from minisgl.distributed import DistributedInfo
-from minisgl.scheduler import SchedulerConfig
-from minisgl.utils import cached_load_hf_config, init_logger
+import mlx.core as mx
+from mlx_serve.scheduler import SchedulerConfig
+from mlx_serve.utils import cached_load_hf_config, init_logger
 
 
 @dataclass(frozen=True)
@@ -24,13 +23,13 @@ class ServerArgs(SchedulerConfig):
 
     @property
     def zmq_frontend_addr(self) -> str:
-        return "ipc:///tmp/minisgl_3" + self._unique_suffix
+        return "ipc:///tmp/mlx_serve_3" + self._unique_suffix
 
     @property
     def zmq_tokenizer_addr(self) -> str:
         if self.share_tokenizer:
             return self.zmq_detokenizer_addr
-        result = "ipc:///tmp/minisgl_4" + self._unique_suffix
+        result = "ipc:///tmp/mlx_serve_4" + self._unique_suffix
         assert result != self.zmq_detokenizer_addr
         return result
 
@@ -61,10 +60,9 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     Returns:
         EngineConfig instance with parsed arguments
     """
-    from minisgl.attention import validate_backend
-    from minisgl.kvcache import SUPPORTED_CACHE_MANAGER
+    from mlx_serve.kvcache import SUPPORTED_CACHE_MANAGER
 
-    parser = argparse.ArgumentParser(description="MiniSGL Server Arguments")
+    parser = argparse.ArgumentParser(description="MLX-Serve Server Arguments")
 
     parser.add_argument(
         "--model-path",
@@ -86,7 +84,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--tp-size",
         type=int,
         default=1,
-        help="The tensor parallelism size.",
+        help="Tensor parallelism size (currently only 1 is supported).",
     )
 
     parser.add_argument(
@@ -111,22 +109,6 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         help="The fraction of GPU memory to use for KV cache.",
     )
 
-    assert ServerArgs.use_dummy_weight == False
-    parser.add_argument(
-        "--dummy-weight",
-        action="store_true",
-        dest="use_dummy_weight",
-        help="Use dummy weights for testing.",
-    )
-
-    assert ServerArgs.use_pynccl == True
-    parser.add_argument(
-        "--disable-pynccl",
-        action="store_false",
-        dest="use_pynccl",
-        help="Disable PyNCCL for tensor parallelism.",
-    )
-
     parser.add_argument(
         "--host",
         type=str,
@@ -141,14 +123,6 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         dest="server_port",
         default=ServerArgs.server_port,
         help="The port number for the server to listen on.",
-    )
-
-    parser.add_argument(
-        "--cuda-graph-max-bs",
-        "--graph",
-        type=int,
-        default=ServerArgs.cuda_graph_max_bs,
-        help="The maximum batch size for CUDA graph capture. None means auto-tuning based on the GPU memory.",
     )
 
     parser.add_argument(
@@ -180,10 +154,9 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     parser.add_argument(
         "--attention-backend",
         "--attn",
-        type=validate_backend,
+        type=str,
         default=ServerArgs.attention_backend,
-        help="The attention backend to use. If two backends are specified,"
-        " the first one is used for prefill and the second one for decode.",
+        help="Attention backend name.",
     )
 
     parser.add_argument(
@@ -206,7 +179,6 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     # resolve some arguments
     run_shell |= kwargs.pop("shell_mode")
     if run_shell:
-        kwargs["cuda_graph_max_bs"] = 1
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
 
@@ -214,20 +186,26 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
 
     DTYPE_MAP = {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
+        "float16": mx.float16,
+        "bfloat16": mx.bfloat16,
+        "float32": mx.float32,
     }
     if (dtype_str := kwargs["dtype"]) != "auto":
         kwargs["dtype"] = DTYPE_MAP[dtype_str]
     else:
-        dtype_or_str = cached_load_hf_config(kwargs["model_path"]).dtype
-        if isinstance(dtype_or_str, str):
-            kwargs["dtype"] = DTYPE_MAP[dtype_or_str]
+        dtype_or_str = getattr(cached_load_hf_config(kwargs["model_path"]), "torch_dtype", None)
+        dtype_name = str(dtype_or_str).lower() if dtype_or_str is not None else ""
+        if "bfloat16" in dtype_name:
+            kwargs["dtype"] = mx.bfloat16
+        elif "float16" in dtype_name:
+            kwargs["dtype"] = mx.float16
         else:
-            kwargs["dtype"] = dtype_or_str
+            kwargs["dtype"] = mx.float32
 
-    kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
+    tp_size = kwargs["tensor_parallel_size"]
+    if tp_size != 1:
+        logger = init_logger(__name__)
+        logger.warning("tensor-parallel-size=%s is not supported yet, fallback to 1.", tp_size)
     del kwargs["tensor_parallel_size"]
 
     result = ServerArgs(**kwargs)

@@ -2,24 +2,24 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import torch
-from minisgl.kvcache import BaseCacheHandle, create_cache_manager
+import mlx.core as mx
+from mlx_serve.kvcache import BaseCacheHandle, create_cache_manager
 
 if TYPE_CHECKING:
     from .utils import PendingReq
 
 
 class CacheManager:
-    def __init__(self, device: torch.device, num_pages: int, type: str):
+    def __init__(self, device: None, num_pages: int, type: str):
         # TODO: support page_size > 1
-        self._free_slots = torch.arange(num_pages, dtype=torch.int32, device=device)
+        self._free_slots = mx.arange(num_pages, dtype=mx.int32)
         self.device = device
         self.manager = create_cache_manager(device=device, type=type)
         self.num_pages = num_pages
 
-    def _free(self, indices: torch.Tensor) -> None:
+    def _free(self, indices: mx.array) -> None:
         if len(indices) > 0:
-            self._free_slots = torch.cat([self._free_slots, indices])
+            self._free_slots = mx.concatenate([self._free_slots, indices])
 
     def match_req(self, req: PendingReq):
         input_len = req.input_len
@@ -36,7 +36,7 @@ class CacheManager:
     def unlock(self, handle: BaseCacheHandle) -> None:
         self.manager.lock_handle(handle, unlock=True)
 
-    def allocate(self, needed_len: int) -> torch.Tensor:
+    def allocate(self, needed_len: int) -> mx.array:
         if needed_len <= (free_len := len(self._free_slots)):
             allocated = self._free_slots[:needed_len]
             self._free_slots = self._free_slots[needed_len:]
@@ -44,7 +44,7 @@ class CacheManager:
 
         # NOTE: len(evicted) + free_len >= needed_len
         evicted = self.manager.evict(needed_len - free_len)
-        merged = torch.cat([self._free_slots, evicted])
+        merged = mx.concatenate([self._free_slots, evicted])
         assert len(merged) >= needed_len, "Eviction did not free enough space."
 
         allocated = merged[:needed_len]
@@ -54,8 +54,8 @@ class CacheManager:
     def free_and_cache_finished_req(
         self,
         old_handle: BaseCacheHandle,
-        input_ids: torch.Tensor,
-        indices: torch.Tensor,
+        input_ids: mx.array,
+        indices: mx.array,
     ) -> None:
         in_cache_len = self.manager.insert_prefix(input_ids, indices)
         self._free(indices[old_handle.cached_len : in_cache_len])

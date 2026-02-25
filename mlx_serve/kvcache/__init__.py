@@ -10,7 +10,6 @@ from .base import (
     BaseCacheHandle,
     BaseCacheManager,
     BaseKVCache,
-    KVCacheLayout,
     SizeInfo,
 )
 
@@ -30,14 +29,12 @@ def create_kvcache(
     num_pages: int,
     dtype: mx.Dtype,
     device: None = None,
-    cache_layout: KVCacheLayout = KVCacheLayout.LayerFirst,
 ) -> BaseKVCache:
     from .mha_pool import MHAKVCache  # TODO: support other variants (e.g. MLA)
 
     return MHAKVCache(
         num_kv_heads=model_config.num_kv_heads,
         num_pages=num_pages,
-        kv_layout=cache_layout,
         num_layers=model_config.num_layers,
         head_dim=model_config.head_dim,
         device=device,

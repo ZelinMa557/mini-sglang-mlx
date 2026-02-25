@@ -11,18 +11,16 @@ from typing import Callable, Dict, List, Literal, Tuple
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
-from minisgl.core import SamplingParams
-from minisgl.env import ENV
-from minisgl.message import (
+from mlx_serve.core import SamplingParams
+from mlx_serve.env import ENV
+from mlx_serve.message import (
     BaseFrontendMsg,
     BaseTokenizerMsg,
     BatchFrontendMsg,
     TokenizeMsg,
     UserReply,
 )
-from minisgl.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
-from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import WordCompleter
+from mlx_serve.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
@@ -87,7 +85,7 @@ class ModelCard(BaseModel):
     id: str
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
-    owned_by: str = "mini-sglang"
+    owned_by: str = "mlx-serve"
     root: str
 
 
@@ -208,7 +206,7 @@ async def lifespan(_: FastAPI):
         _GLOBAL_STATE.shutdown()
 
 
-app = FastAPI(title="MiniSGL API Server", version="0.0.1", lifespan=lifespan)
+app = FastAPI(title="MLX-Serve API Server", version="0.0.1", lifespan=lifespan)
 
 
 @app.post("/generate")
@@ -329,70 +327,6 @@ async def async_input(prompt=""):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: input(prompt))
 
-
-async def shell():
-    commands = ["/exit", "/reset"]
-    completer = WordCompleter(commands)
-    session = PromptSession("$ ", completer=completer)
-
-    try:
-        history: List[Tuple[str, str]] = []
-        while True:
-            need_stop = False
-            cmd = (await session.prompt_async()).strip()
-            if cmd == "":
-                continue
-            if cmd.startswith("/"):
-                if cmd == "/exit":
-                    return
-                if cmd == "/reset":
-                    history = []
-                    continue
-                raise ValueError(f"Unknown command: {cmd}")
-            history_messages: List[Message] = []
-            for user_msg, assistant_msg in history:
-                history_messages.append(Message(role="user", content=user_msg))
-                history_messages.append(Message(role="assistant", content=assistant_msg))
-            # send to server
-            req = OpenAICompletionRequest(
-                model="",
-                messages=history_messages + [Message(role="user", content=cmd)],
-                max_tokens=ENV.SHELL_MAX_TOKENS.value,
-                top_k=ENV.SHELL_TOP_K.value,
-                top_p=ENV.SHELL_TOP_P.value,
-                temperature=ENV.SHELL_TEMPERATURE.value,
-                stream=True,
-            )
-            cur_msg = ""
-            async for chunk in (await shell_completion(req)).body_iterator:
-                if need_stop:
-                    break
-                msg = chunk.decode()  # type: ignore
-                assert msg.startswith("data: "), msg
-                msg = msg[6:]
-                assert msg.endswith("\n"), msg
-                msg = msg[:-1]
-                if msg == "[DONE]":
-                    continue
-                cur_msg += msg
-                print(msg, end="", flush=True)
-            print("", flush=True)
-            history.append((cmd, cur_msg))
-    except EOFError:
-        # user pressed Ctrl-D
-        pass
-    finally:
-        print("Exiting shell...")
-        await asyncio.sleep(0.1)
-        get_global_state().shutdown()
-        # then kill all the subprocesses
-        import psutil
-
-        parent = psutil.Process()
-        for child in parent.children(recursive=True):
-            child.kill()
-
-
 def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_shell: bool) -> None:
     """
     Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
@@ -405,9 +339,6 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
     """
 
     global _GLOBAL_STATE
-
-    if run_shell:
-        assert not config.use_dummy_weight, "Shell mode does not support dummy weights."
 
     host = config.server_host
     port = config.server_port

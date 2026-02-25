@@ -46,8 +46,6 @@ def init_logger(
         pid = os.getpid()
         suffix = f"|pid={pid}{suffix}"
 
-    tp_info = None
-
     # Color formatter class
     class ColorFormatter(logging.Formatter):
         """Formatter with colors and pretty output"""
@@ -64,17 +62,9 @@ def init_logger(
         BOLD = "\033[1m"
 
         def format(self, record):
-            from minisgl.distributed import try_get_tp_info
-
             # Format timestamp like SGLang: [YYYY-MM-DD|HH:MM:SS|pid=1234]
             timestamp = self.formatTime(record, "[%Y-%m-%d|%H:%M:%S{suffix}]")
-            nonlocal tp_info
-            tp_info = tp_info or try_get_tp_info()
-            if tp_info is not None and use_tp_rank is not False:
-                real_suffix = f"{suffix}|core|rank={tp_info.rank}"
-            else:
-                real_suffix = suffix
-            timestamp = timestamp.format(suffix=real_suffix)
+            timestamp = timestamp.format(suffix=suffix)
 
             # Get color for log level
             level_color = self.COLORS.get(record.levelname, "")
@@ -101,13 +91,8 @@ def init_logger(
     logger.propagate = False
 
     def _call_rank0(msg, *args, _which, **kwargs):
-        from minisgl.distributed import get_tp_info
-
-        nonlocal tp_info
-        tp_info = tp_info or get_tp_info()
-        assert tp_info is not None, "TP info not set yet"
-        if tp_info.is_primary():
-            getattr(logger, _which)(msg, *args, **kwargs)
+        # Kept for compatibility with existing call sites.
+        getattr(logger, _which)(msg, *args, **kwargs)
 
     if TYPE_CHECKING:
 
