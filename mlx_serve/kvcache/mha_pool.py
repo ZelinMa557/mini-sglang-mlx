@@ -21,7 +21,7 @@ class MHAKVCache(BaseKVCache):
         num_pages: int,
         dtype: mx.Dtype,
     ):
-        self._kv_buffer = mx.empty(
+        self._kv_buffer = mx.zeros(
             (2, num_layers, num_pages, num_kv_heads, head_dim),
             dtype=dtype,
         )

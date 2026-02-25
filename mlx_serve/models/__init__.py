@@ -147,7 +147,7 @@ def _apply_quantization(
         model,
         group_size=quantization["group_size"],
         bits=quantization["bits"],
-        mode=quantization.get("mode", "affine"),
+        # mode=quantization.get("mode", "affine"),
         class_predicate=class_predicate,
     )
 

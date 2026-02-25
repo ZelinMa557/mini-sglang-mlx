@@ -29,5 +29,5 @@ class TokenizeManager:
             input_ids: mx.array = mx.array(  # type: ignore
                 self.tokenizer.encode(prompt, return_tensors="np")  
             )
-            results.append(input_ids.view(-1).to(mx.int32))
+            results.append(input_ids[0])
         return results

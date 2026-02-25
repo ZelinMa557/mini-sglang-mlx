@@ -8,7 +8,7 @@ class TableManager:
         self.page_table = page_table
         # NOTE: dummy request also use this pool to get the input ids, so we need to
         # make sure the token pool is initialized with valid values (token_id = 0).
-        self.token_pool = mx.zeros_like(page_table, dtype=mx.int32)
+        self.token_pool = mx.zeros_like(page_table)
 
     @property
     def available_size(self) -> int:

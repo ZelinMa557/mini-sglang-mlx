@@ -47,7 +47,7 @@ class Attention(nn.Module):
 
         self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
-        self.rope = RotaryEmbedding(head_size=head_dim, rotary_dim=head_dim, base=args.rope_scaling)
+        self.rope = RotaryEmbedding(head_size=head_dim, rotary_dim=head_dim, base=args.rope_theta)
 
     def __call__(
         self,
@@ -122,6 +122,7 @@ class Qwen3Model(nn.Module):
         self,
         inputs: mx.array,
     ):
+        print("inputs", inputs)
         h = self.embed_tokens(inputs)
         for layer in self.layers:
             h = layer(h)

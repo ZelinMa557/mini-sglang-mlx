@@ -22,9 +22,9 @@ def serialize_type(self) -> Dict:
     serialized = {}
 
     if isinstance(self, mx.array):
-        assert self.dim() == 1, "we can only serialize 1D tensor for now"
+        assert self.ndim == 1, "we can only serialize 1D tensor for now"
         serialized["__type__"] = "Tensor"
-        serialized["buffer"] = self.numpy().tobytes()
+        serialized["buffer"] = np.array(self).tobytes()
         serialized["dtype"] = str(self.dtype)
         return serialized
 
@@ -54,7 +54,7 @@ def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any:
     # we can only serialize 1D tensor for now
     if type_name == "Tensor":
         buffer = data["buffer"]
-        dtype_str = data["dtype"].replace("torch.", "")
+        dtype_str = data["dtype"].replace("mlx.core.", "")
         np_dtype = getattr(np, dtype_str)
         assert isinstance(buffer, bytes)
         np_tensor = np.frombuffer(buffer, dtype=np_dtype)
