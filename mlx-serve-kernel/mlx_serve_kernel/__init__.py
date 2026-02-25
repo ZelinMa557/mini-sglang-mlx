@@ -1,5 +1,4 @@
 from ._ext import (
-    varlen_rope,
     moe_sum_reduce,
     moe_sum_reduce_with_reorder,
     moe_scatter_broadcast,

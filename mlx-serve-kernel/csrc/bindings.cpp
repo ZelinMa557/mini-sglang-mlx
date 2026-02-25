@@ -3,7 +3,6 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/variant.h>
 
-#include "varlen_rope.hpp"
 #include "moe_utils.h"
 #include "store_kv_cache.h"
 #include "fast_compare_key.h"
@@ -14,12 +13,6 @@ using namespace nb::literals;
 
 NB_MODULE(_ext, m) {
   m.doc() = "Kernel library for mlx serve";
-  m.def(
-      "varlen_rope", &mlx_serve::varlen_rope, "x"_a, "positions"_a, "dims"_a,
-      "base"_a, nb::kw_only(), "stream"_a = nb::none(),
-      nb::sig("def varlen_rope(x: array, positions: array, "
-              "dims:int, base:float, *, stream: Union[None, Stream, Device] = "
-              "None) -> array"));
   m.def("moe_sum_reduce", &mlx_serve::moe_sum_reduce, "y"_a, "scores"_a,
         nb::kw_only(), "stream"_a = nb::none(),
         nb::sig(

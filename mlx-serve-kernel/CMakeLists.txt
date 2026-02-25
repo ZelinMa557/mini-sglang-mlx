@@ -32,8 +32,7 @@ find_package(MLX CONFIG REQUIRED)
 add_library(mlx_serve_kernel)
 
 # Add sources
-target_sources(mlx_serve_kernel PUBLIC ${CMAKE_CURRENT_LIST_DIR}/csrc/varlen_rope.hpp
-                                       ${CMAKE_CURRENT_LIST_DIR}/csrc/moe_utils.cpp
+target_sources(mlx_serve_kernel PUBLIC ${CMAKE_CURRENT_LIST_DIR}/csrc/moe_utils.cpp
                                        ${CMAKE_CURRENT_LIST_DIR}/csrc/store_kv_cache.cpp
                                        ${CMAKE_CURRENT_LIST_DIR}/csrc/fast_compare_key.cpp
                                        ${CMAKE_CURRENT_LIST_DIR}/csrc/paged_decode_attention.cpp
@@ -55,7 +54,6 @@ if(MLX_BUILD_METAL)
     TITLE
     mlx_serve_kernel
     SOURCES
-    ${CMAKE_CURRENT_LIST_DIR}/csrc/varlen_rope.metal
     ${CMAKE_CURRENT_LIST_DIR}/csrc/moe_utils.metal
     ${CMAKE_CURRENT_LIST_DIR}/csrc/store_kv_cache.metal
     ${CMAKE_CURRENT_LIST_DIR}/csrc/paged_decode_attention.metal

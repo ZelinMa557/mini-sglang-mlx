@@ -1,10 +1,6 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_serve_kernel import varlen_rope
-from mlx_serve.engine.forward_batch import ForwardBatch
-
-
 class RotaryEmbedding(nn.Module):
     def __init__(
         self,
@@ -16,11 +12,10 @@ class RotaryEmbedding(nn.Module):
         self.head_size = head_size
         self.rotary_dim = rotary_dim
         self.base = base
+        self.rope_impl = nn.RoPE(rotary_dim, base=base)
 
-    def __call__(self, hidden_state: mx.array, forward_batch: ForwardBatch) -> mx.array:
-        return varlen_rope(
-            hidden_state,
-            forward_batch.position_ids,
-            self.rotary_dim,
-            self.base
-        )
+    def __call__(self, hidden_state: mx.array, position_ids: mx.array) -> mx.array:
+        B, H, D = hidden_state.shape
+        hidden_state = hidden_state.reshape(B, H, 1, D)
+        hidden_state = self.rope_impl(hidden_state, offset=position_ids)
+        return hidden_state.squeeze(2)
