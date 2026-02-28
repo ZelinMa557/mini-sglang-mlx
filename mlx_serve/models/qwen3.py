@@ -64,7 +64,7 @@ class Attention(nn.Module):
         ctx = get_global_ctx()
         metadata = ctx.batch.attn_metadata
         queries = self.rope(queries, metadata.positions)
-        keys = self.rope(queries, metadata.positions)
+        keys = self.rope(keys, metadata.positions)
         output = ctx.attn_backend.forward(queries, keys, values, self.layer_id, ctx.batch)
         output = output.reshape(-1, self.qo_attn_dim)
         return self.o_proj(output)
@@ -92,6 +92,7 @@ class TransformerBlock(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
+        self.layer_id = layer_id
         self.args = args
 
     def __call__(
@@ -122,7 +123,6 @@ class Qwen3Model(nn.Module):
         self,
         inputs: mx.array,
     ):
-        print("inputs", inputs)
         h = self.embed_tokens(inputs)
         for layer in self.layers:
             h = layer(h)

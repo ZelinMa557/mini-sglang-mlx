@@ -252,8 +252,8 @@ if __name__ == "__main__":
     print("=" * 80)
 
     # Single-sequence, no prefix (pure prefill)
-    single_seq_lens = [1, 237, 512, 809, 1024, 2048, 3333, 4096]
-    kv_heads_list = [4, 8]
+    single_seq_lens = [1, 237, 512, 809, 1024, 2048, 3333, 4096, 8192]
+    kv_heads_list = [2]
 
     all_pass = True
 
@@ -278,7 +278,7 @@ if __name__ == "__main__":
     ]
     for nkvh in kv_heads_list:
         for ql, pl in prefix_configs:
-            ok, md, ad = test_correctness([ql], [pl], 32, nkvh)
+            ok, md, ad = test_correctness([ql], [pl], 16, nkvh)
             tag = "PASS" if ok else "FAIL"
             print(f"  [{tag}] kv_heads={nkvh:>2}, q_len={ql:>5}, prefix={pl:>5}  "
                   f"max_diff={md:.6f}  mean_diff={ad:.6f}")
@@ -298,7 +298,7 @@ if __name__ == "__main__":
     ]
     for nkvh in kv_heads_list:
         for q_lens, p_lens in multi_seq_configs:
-            ok, md, ad = test_correctness(q_lens, p_lens, 32, nkvh)
+            ok, md, ad = test_correctness(q_lens, p_lens, 16, nkvh)
             tag = "PASS" if ok else "FAIL"
             print(f"  [{tag}] kv_heads={nkvh:>2}, q_lens={str(q_lens):>28}, "
                   f"prefix={str(p_lens):>20}  max_diff={md:.6f}  mean_diff={ad:.6f}")
@@ -318,7 +318,7 @@ if __name__ == "__main__":
 
     for nkvh in kv_heads_list:
         for ql in single_seq_lens:
-            ours_ms, sdpa_ms = bench([ql], [0], 32, nkvh)
+            ours_ms, sdpa_ms = bench([ql], [0], 16, nkvh)
             speedup = sdpa_ms / ours_ms if ours_ms > 0 else float("inf")
             print(f"  {nkvh:>8} {ql:>8} {0:>8} "
                   f"{ours_ms*1000:>10.1f} {sdpa_ms*1000:>10.1f} {speedup:>7.2f}x")

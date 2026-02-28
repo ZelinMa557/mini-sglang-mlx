@@ -135,7 +135,7 @@ class Engine:
             req.complete_one()
 
         next_tokens = self.sampler.sample(last_logits, args)
-        return ForwardOutput(next_tokens=mx.astype(next_tokens, mx.int32))
+        return ForwardOutput(next_tokens=next_tokens.astype(mx.int32))
 
     def shutdown(self) -> None:
         pass

@@ -94,12 +94,11 @@ def run_functional_test(
     # Naive 路径：拷贝空 cache 后逐行 scatter
     k_cache_naive = mx.zeros_like(k_cache_empty)
     v_cache_naive = mx.zeros_like(v_cache_empty)
-    print(v_cache_naive)
     k_cache_naive, v_cache_naive = store_kv_cache_naive(
         k_cache_naive, v_cache_naive, out_loc, k, v
     )
     mx.eval(k_cache_naive, v_cache_naive)
-    print(v_cache_naive)
+    print(v_cache_naive, v_cache_kernel)
 
     k_ok = mx.allclose(k_cache_kernel, k_cache_naive, rtol=1e-5, atol=1e-5)
     v_ok = mx.allclose(v_cache_kernel, v_cache_naive, rtol=1e-5, atol=1e-5)

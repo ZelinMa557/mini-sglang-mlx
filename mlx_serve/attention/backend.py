@@ -85,7 +85,6 @@ class AttnBackend:
     ) -> mx.array:
         metadata = batch.attn_metadata
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
-
         k_cache = self.kvcache.k_cache(layer_id)
         v_cache = self.kvcache.v_cache(layer_id)
 

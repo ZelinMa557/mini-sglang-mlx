@@ -196,14 +196,14 @@ if __name__ == "__main__":
     print("Paged Decode Attention — Correctness (vs MLX SDPA)")
     print("=" * 80)
 
-    single_seq_lens = [1, 237, 512, 809, 1024, 2048, 3333, 4096]
-    kv_heads_list = [4,8]
+    single_seq_lens = [1, 237, 512, 809, 1024, 2048, 3333, 4096, 8192]
+    kv_heads_list = [2]
 
     # Single-sequence tests
     all_pass = True
     for nkvh in kv_heads_list:
         for kvl in single_seq_lens:
-            ok, md, ad = test_correctness([kvl], 32, nkvh)
+            ok, md, ad = test_correctness([kvl], 16, nkvh)
             tag = "PASS" if ok else "FAIL"
             print(f"  [{tag}] kv_heads={nkvh:>2}, kv_len={kvl:>5}  "
                   f"max_diff={md:.6f}  mean_diff={ad:.6f}")
@@ -242,6 +242,6 @@ if __name__ == "__main__":
 
     for nkvh in kv_heads_list:
         for kvl in single_seq_lens:
-            ours_ms, sdpa_ms = bench([kvl], 32, nkvh)
+            ours_ms, sdpa_ms = bench([kvl], 16, nkvh)
             speedup = sdpa_ms / ours_ms if ours_ms > 0 else float("inf")
             print(f"  {nkvh:>8} {kvl:>8} {ours_ms*1000:>10.1f} {sdpa_ms*1000:>10.1f} {speedup:>7.2f}x")

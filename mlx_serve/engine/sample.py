@@ -80,4 +80,4 @@ class Sampler:
         return BatchSamplingArgs(temperatures, top_p=top_p)
 
     def sample(self, logits: mx.array, args: BatchSamplingArgs) -> mx.array:
-        return mx.astype(_sample(logits, args), mx.int32)
+        return _sample(logits, args).astype(mx.int32)
