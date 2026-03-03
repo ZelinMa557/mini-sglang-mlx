@@ -18,9 +18,8 @@ class EngineConfig:
     max_running_req: int = 16
     attention_backend: str = "auto"
     page_size: int = 1
-    memory_ratio: float = 0.8
+    kv_cache_gb: float | None = None
     max_seq_len_override: int | None = None
-    num_page_override: int | None = None  # if not None, will override the number of pages
 
     @cached_property
     def hf_config(self):

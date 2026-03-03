@@ -99,18 +99,19 @@ class Engine:
         self.page_table[self.dummy_req.table_idx, :] = self.dummy_page
 
     def _determine_num_pages(self, config: EngineConfig) -> int:
-        cache_per_page = (
+        bytes_per_page = (
             2  # key + value
             * self.model_meta.head_dim
             * self.model_meta.num_kv_heads
             * config.page_size
-            * 2 # 2 == sizeof(float16) == sizeof(bfloat16)
+            * 2  # sizeof(float16) == sizeof(bfloat16)
             * self.model_meta.num_layers
         )
-        num_pages = config.num_page_override
-        if num_pages is None:
-            # Conservative default for Apple unified memory. Override with
-            # --num-pages when precise control is needed.
+
+        if config.kv_cache_gb is not None:
+            kv_bytes = config.kv_cache_gb * (1024 ** 3)
+            num_pages = int(kv_bytes / bytes_per_page)
+        else:
             max_seq_len = (
                 config.max_seq_len_override
                 if config.max_seq_len_override is not None
@@ -118,9 +119,11 @@ class Engine:
             )
             num_pages = min(max_seq_len * max(config.max_running_req, 1), 262_144)
 
-        assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-tokens"
-        num_pages = 8192 * 4 # todo
-        real_kv_size = num_pages * cache_per_page / (1024**3)
+        assert num_pages > 1, (
+            "Not enough memory for KV cache. "
+            "Increase --kv-cache-gb or reduce model size."
+        )
+        real_kv_size = num_pages * bytes_per_page / (1024 ** 3)
         logger.info("Allocating %s pages for KV cache, K + V = %.2f GB", num_pages, real_kv_size)
         return num_pages
 

@@ -103,10 +103,11 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
-        "--memory-ratio",
+        "--kv-cache-gb",
         type=float,
-        default=ServerArgs.memory_ratio,
-        help="The fraction of GPU memory to use for KV cache.",
+        dest="kv_cache_gb",
+        default=ServerArgs.kv_cache_gb,
+        help="Size of the KV cache in GB. If not set, auto-determined from model config.",
     )
 
     parser.add_argument(
@@ -140,15 +141,6 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         dest="max_extend_tokens",
         default=ServerArgs.max_extend_tokens,
         help="Chunk Prefill maximum chunk size in tokens.",
-    )
-
-    parser.add_argument(
-        "--num-pages",
-        "--num-tokens",
-        dest="num_page_override",
-        type=int,
-        default=ServerArgs.num_page_override,
-        help="Set the maximum number of pages for KVCache.",
     )
 
     parser.add_argument(

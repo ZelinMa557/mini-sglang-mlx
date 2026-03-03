@@ -30,8 +30,9 @@ class RadixTreeNode:
 
     def set_key_value(self, key: mx.array, value: mx.array) -> None:
         assert len(key) == len(value)
-        self._key = key
-        self._value = value
+        self._key = mx.contiguous(key)
+        self._value = mx.contiguous(value)
+        mx.eval(self._key, self._value)
         self._length = len(key)
 
     def set_parent(self, parent: RadixTreeNode) -> None:
@@ -58,6 +59,8 @@ class RadixTreeNode:
         return len(self.children) == 0
 
     def get_match_len(self, input_ids: mx.array) -> int:
+        input_ids = mx.contiguous(input_ids)
+        mx.eval(input_ids)
         return fast_compare_key(self._key, input_ids)
 
     def _split_at(self, pos: int) -> RadixTreeNode:
