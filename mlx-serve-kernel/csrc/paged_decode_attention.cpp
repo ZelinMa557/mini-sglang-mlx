@@ -42,9 +42,9 @@ mx::array paged_decode_attention(
   int head_dim = q.shape(2);
   int num_kv_heads = k_cache.shape(1);
 
-  if (head_dim != 128 && head_dim != 576) {
+  if (head_dim != 128 && head_dim != 256) {
     throw std::runtime_error(
-        "paged_decode_attention: head_dim must be 128, or 576");
+        "paged_decode_attention: head_dim must be 128 or 256");
   }
   if (num_q_heads % num_kv_heads != 0) {
     throw std::runtime_error(

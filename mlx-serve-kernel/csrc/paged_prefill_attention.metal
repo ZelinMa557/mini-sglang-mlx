@@ -287,11 +287,9 @@ template <
     paged_prefill_attention, type, dk, dv, 8, 32, 4)
 
 // float16
-instantiate_prefill(float16, half, 64, 64)
 instantiate_prefill(float16, half, 128, 128)
-instantiate_prefill(float16, half, 512, 512)
+instantiate_prefill(float16, half, 256, 256)
 
 // bfloat16
-instantiate_prefill(bfloat16, bfloat16_t, 64, 64)
 instantiate_prefill(bfloat16, bfloat16_t, 128, 128)
-instantiate_prefill(bfloat16, bfloat16_t, 512, 512)
+instantiate_prefill(bfloat16, bfloat16_t, 256, 256)

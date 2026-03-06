@@ -375,11 +375,13 @@ template <typename T, short DV>
 
 // float16
 instantiate_stage1(float16, half, 128, 128)
+instantiate_stage1(float16, half, 256, 256)
 
 instantiate_stage2(float16, half, 128)
+instantiate_stage2(float16, half, 256)
 
 // bfloat16
 instantiate_stage1(bfloat16, bfloat16_t, 128, 128)
-instantiate_stage1(bfloat16, bfloat16_t, 576, 576)
+instantiate_stage1(bfloat16, bfloat16_t, 256, 256)
 instantiate_stage2(bfloat16, bfloat16_t, 128)
-instantiate_stage2(bfloat16, bfloat16_t, 576)
+instantiate_stage2(bfloat16, bfloat16_t, 256)

@@ -17,7 +17,12 @@ from mlx_serve_kernel import paged_prefill_attention
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-HEAD_DIM = 128
+HEAD_DIM = 256
+HEAD_CONFIGS = [
+    (256, 2, 16),  # (head_dim, kv_heads, q_heads)
+    (256, 4, 16),
+    (256, 4, 24),
+]
 
 
 def build_paged_prefill_inputs(
@@ -253,16 +258,14 @@ if __name__ == "__main__":
 
     # Single-sequence, no prefix (pure prefill)
     single_seq_lens = [1, 237, 512, 809, 1024, 2048, 3333, 4096, 8192]
-    kv_heads_list = [2]
-
     all_pass = True
 
     print("  --- Single sequence, no prefix (pure prefill) ---")
-    for nkvh in kv_heads_list:
+    for head_dim, nkvh, nqh in HEAD_CONFIGS:
         for ql in single_seq_lens:
-            ok, md, ad = test_correctness([ql], [0], 32, nkvh)
+            ok, md, ad = test_correctness([ql], [0], nqh, nkvh, head_dim=head_dim)
             tag = "PASS" if ok else "FAIL"
-            print(f"  [{tag}] kv_heads={nkvh:>2}, q_len={ql:>5}, prefix=0     "
+            print(f"  [{tag}] head_dim={head_dim:>3}, kv_heads={nkvh:>2}, q_heads={nqh:>2}, q_len={ql:>5}, prefix=0     "
                   f"max_diff={md:.6f}  mean_diff={ad:.6f}")
             if not ok:
                 all_pass = False
@@ -276,11 +279,11 @@ if __name__ == "__main__":
         (1024, 512),
         (2048, 1024),
     ]
-    for nkvh in kv_heads_list:
+    for head_dim, nkvh, nqh in HEAD_CONFIGS:
         for ql, pl in prefix_configs:
-            ok, md, ad = test_correctness([ql], [pl], 16, nkvh)
+            ok, md, ad = test_correctness([ql], [pl], nqh, nkvh, head_dim=head_dim)
             tag = "PASS" if ok else "FAIL"
-            print(f"  [{tag}] kv_heads={nkvh:>2}, q_len={ql:>5}, prefix={pl:>5}  "
+            print(f"  [{tag}] head_dim={head_dim:>3}, kv_heads={nkvh:>2}, q_heads={nqh:>2}, q_len={ql:>5}, prefix={pl:>5}  "
                   f"max_diff={md:.6f}  mean_diff={ad:.6f}")
             if not ok:
                 all_pass = False
@@ -296,11 +299,11 @@ if __name__ == "__main__":
         ([1, 512, 2048, 4096], [0, 0, 0, 0]),
         ([128, 256, 512, 1024], [64, 128, 256, 512]),
     ]
-    for nkvh in kv_heads_list:
+    for head_dim, nkvh, nqh in HEAD_CONFIGS:
         for q_lens, p_lens in multi_seq_configs:
-            ok, md, ad = test_correctness(q_lens, p_lens, 16, nkvh)
+            ok, md, ad = test_correctness(q_lens, p_lens, nqh, nkvh, head_dim=head_dim)
             tag = "PASS" if ok else "FAIL"
-            print(f"  [{tag}] kv_heads={nkvh:>2}, q_lens={str(q_lens):>28}, "
+            print(f"  [{tag}] head_dim={head_dim:>3}, kv_heads={nkvh:>2}, q_heads={nqh:>2}, q_lens={str(q_lens):>28}, "
                   f"prefix={str(p_lens):>20}  max_diff={md:.6f}  mean_diff={ad:.6f}")
             if not ok:
                 all_pass = False
@@ -313,12 +316,12 @@ if __name__ == "__main__":
     print("=" * 80)
     print("Paged Prefill Attention — Performance (us)")
     print("=" * 80)
-    print(f"  {'kv_heads':>8} {'q_len':>8} {'prefix':>8} {'ours(us)':>10} {'sdpa(us)':>10} {'speedup':>8}")
-    print("  " + "-" * 58)
+    print(f"  {'hdim':>6} {'kv_heads':>8} {'q_heads':>8} {'q_len':>8} {'prefix':>8} {'ours(us)':>10} {'sdpa(us)':>10} {'speedup':>8}")
+    print("  " + "-" * 80)
 
-    for nkvh in kv_heads_list:
+    for head_dim, nkvh, nqh in HEAD_CONFIGS:
         for ql in single_seq_lens:
-            ours_ms, sdpa_ms = bench([ql], [0], 16, nkvh)
+            ours_ms, sdpa_ms = bench([ql], [0], nqh, nkvh, head_dim=head_dim)
             speedup = sdpa_ms / ours_ms if ours_ms > 0 else float("inf")
-            print(f"  {nkvh:>8} {ql:>8} {0:>8} "
+            print(f"  {head_dim:>6} {nkvh:>8} {nqh:>8} {ql:>8} {0:>8} "
                   f"{ours_ms*1000:>10.1f} {sdpa_ms*1000:>10.1f} {speedup:>7.2f}x")
