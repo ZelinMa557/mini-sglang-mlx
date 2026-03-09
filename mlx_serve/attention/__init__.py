@@ -5,6 +5,7 @@ from .backend import (
     DecodeMetadata,
     PrefillMetadata,
 )
+from .gdn_backend import GDNBackend
 
 __all__ = [
     "AttnBackend",
@@ -12,4 +13,5 @@ __all__ = [
     "BaseAttnMetadata",
     "DecodeMetadata",
     "PrefillMetadata",
+    "GDNBackend",
 ]

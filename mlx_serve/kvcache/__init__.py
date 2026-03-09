@@ -15,6 +15,7 @@ from .base import (
 
 if TYPE_CHECKING:
     from mlx_serve.models import ModelConfig
+    from .mamba_pool import MambaStatePool
 
 
 class CacheManagerCreator(Protocol):
@@ -54,6 +55,14 @@ def create_radix_cache_manager(device: None = None) -> BaseCacheManager:
     return RadixCacheManager(device=device)
 
 
+def create_hybrid_radix_cache_manager(
+    mamba_pool: "MambaStatePool", device: None = None
+) -> BaseCacheManager:
+    from .radix_manager import HybridRadixCacheManager
+
+    return HybridRadixCacheManager(mamba_pool=mamba_pool, device=device)
+
+
 SUPPORTED_CACHE_MANAGER.register("naive")(create_naive_cache_manager)
 SUPPORTED_CACHE_MANAGER.register("radix")(create_radix_cache_manager)
 
@@ -65,8 +74,8 @@ def create_cache_manager(device: None = None, type: str = "naive") -> BaseCacheM
 __all__ = [
     "create_kvcache",
     "create_cache_manager",
+    "create_hybrid_radix_cache_manager",
     "BaseKVCache",
-    "KVCacheLayout",
     "BaseCacheHandle",
     "BaseCacheManager",
     "SizeInfo",

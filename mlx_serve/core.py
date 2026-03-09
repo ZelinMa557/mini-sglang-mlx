@@ -7,8 +7,9 @@ from typing import TYPE_CHECKING, List, Literal
 import mlx.core as mx
 
 if TYPE_CHECKING:
-    from mlx_serve.attention import AttnBackend, BaseAttnMetadata
+    from mlx_serve.attention import AttnBackend, BaseAttnMetadata, GDNBackend
     from mlx_serve.kvcache import BaseCacheHandle
+    from mlx_serve.kvcache.mamba_pool import MambaStatePool
 
 
 @dataclass
@@ -33,6 +34,7 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    mamba_slot: int | None = None  # slot in MambaStatePool for hybrid models
 
     def __post_init__(self) -> None:
         self.device_len = len(self.input_ids)
@@ -97,6 +99,8 @@ class Batch:
 class Context:
     page_size: int
     attn_backend: AttnBackend
+    mamba_pool: MambaStatePool | None = None
+    gdn_backend: GDNBackend | None = None
     _batch: Batch | None = field(default=None, init=False)
 
     @property

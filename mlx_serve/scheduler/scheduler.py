@@ -44,7 +44,14 @@ class Scheduler(SchedulerIOMixin):
         super().__init__(config)
 
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
-        self.cache_manager = CacheManager(None, self.engine.num_pages, config.cache_type)
+        self.is_hybrid = self.engine.is_hybrid
+        if self.is_hybrid:
+            from .cache import HybridCacheManager
+            self.cache_manager = HybridCacheManager(
+                None, self.engine.num_pages, self.engine.mamba_pool,
+            )
+        else:
+            self.cache_manager = CacheManager(None, self.engine.num_pages, config.cache_type)
         self.decode_manager = DecodeManager()
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
@@ -70,15 +77,19 @@ class Scheduler(SchedulerIOMixin):
             next_token = int(next_tokens[i].item())
             req.append_host(mx.array([next_token], dtype=mx.int32))
             finished = not req.can_decode()
+            is_eos = next_token == self.eos_token_id
             if not req.sampling_params.ignore_eos:
-                finished |= next_token == self.eos_token_id
+                finished |= is_eos
             reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
 
-            # free resources if the req is finished and not ongoing
             if finished:
+                reason = "eos" if is_eos else "max_tokens"
+                logger.info(
+                    "[Done] uid=%d  reason=%s  total_tokens=%d",
+                    req.uid, reason, req.device_len,
+                )
                 self.finished_reqs.add(req)
                 self.decode_manager.remove_req(req)
-                logger.debug("Request %s is finished", req)
 
         for req in self.finished_reqs:
             self.table_manager.free(req.table_idx)
@@ -86,6 +97,7 @@ class Scheduler(SchedulerIOMixin):
                 req.cache_handle,
                 req.input_ids[: req.cached_len],
                 self.page_table[req.table_idx, : req.cached_len],
+                mamba_slot=req.mamba_slot,
             )
 
         self.finished_reqs.clear()
@@ -98,7 +110,10 @@ class Scheduler(SchedulerIOMixin):
         elif isinstance(msg, ExitMsg):
             raise KeyboardInterrupt
         elif isinstance(msg, UserMsg):
-            logger.debug("Received user msg: %s", msg)
+            logger.info(
+                "[NewReq] uid=%d  input_len=%d  max_tokens=%d",
+                msg.uid, len(msg.input_ids), msg.sampling_params.max_tokens,
+            )
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:
@@ -117,6 +132,13 @@ class Scheduler(SchedulerIOMixin):
             raise NotImplementedError
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        req_info = ", ".join(
+            f"uid={r.uid}(cached={r.cached_len} dev={r.device_len} ext={r.extend_len})"
+            for r in batch.reqs
+        )
+        logger.debug(
+            "[Batch] phase=%s  reqs=%d  [%s]", batch.phase, len(batch.reqs), req_info,
+        )
         needed_size = sum(r.extend_len for r in batch.reqs)
         batch.out_loc = self.cache_manager.allocate(needed_size)
         batch.padded_reqs = batch.reqs

@@ -51,6 +51,8 @@ def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply]:
 class GenerateRequest(BaseModel):
     prompt: str
     max_tokens: int
+    temperature: float = 1.0
+    top_p: float = 1.0
     ignore_eos: bool = False
 
 
@@ -67,7 +69,7 @@ class OpenAICompletionRequest(BaseModel):
     prompt: str | None = None
     messages: List[Message] | None = None
 
-    max_tokens: int = 16
+    max_tokens: int = 4096
     temperature: float = 1.0
 
     top_k: int = -1
@@ -186,11 +188,15 @@ class FrontendManager:
 
     async def abort_user(self, uid: int):
         await asyncio.sleep(0.1)
+        still_pending = uid in self.ack_map
         if uid in self.ack_map:
             del self.ack_map[uid]
         if uid in self.event_map:
             del self.event_map[uid]
-        logger.warning("Aborting request for user %s", uid)
+        logger.warning(
+            "[Abort] uid=%d  still_pending=%s (client disconnected?)",
+            uid, still_pending,
+        )
 
     def shutdown(self):
         self.send_tokenizer.stop()
@@ -231,7 +237,7 @@ async def generate(req: GenerateRequest):
     return StreamingResponse(
         state.stream_generate(uid),
         media_type="text/event-stream",
-        background=BackgroundTask(lambda: _abort),
+        background=BackgroundTask(_abort),
     )
 
 
@@ -249,8 +255,16 @@ async def v1_completions(req: OpenAICompletionRequest):
         assert req.prompt is not None, "Either 'messages' or 'prompt' must be provided"
         prompt = req.prompt
 
-    # TODO: support more sampling parameters
     uid = state.new_user()
+    msg_summary = ""
+    if req.messages:
+        msg_summary = " | ".join(f"{m.role}: {m.content[:80]}" for m in req.messages)
+    else:
+        msg_summary = str(prompt)[:200]
+    logger.info(
+        "[API] uid=%d  max_tokens=%d  temp=%.2f  stream=%s  msgs=[%s]",
+        uid, req.max_tokens, req.temperature, req.stream, msg_summary,
+    )
     await state.send_one(
         TokenizeMsg(
             uid=uid,
@@ -265,13 +279,31 @@ async def v1_completions(req: OpenAICompletionRequest):
         )
     )
 
+    if not req.stream:
+        full_text = ""
+        async for ack in state.wait_for_ack(uid):
+            full_text += ack.incremental_output
+            if ack.finished:
+                break
+        return {
+            "id": f"cmpl-{uid}",
+            "object": "chat.completion",
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": full_text},
+                    "index": 0,
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+
     async def _abort():
         await state.abort_user(uid)
 
     return StreamingResponse(
         state.stream_chat_completions(uid),
         media_type="text/event-stream",
-        background=BackgroundTask(lambda: _abort),
+        background=BackgroundTask(_abort),
     )
 
 
@@ -308,7 +340,7 @@ async def shell_completion(req: OpenAICompletionRequest):
     return StreamingResponse(
         state.stream_generate(uid),
         media_type="text/event-stream",
-        background=BackgroundTask(lambda: _abort),
+        background=BackgroundTask(_abort),
     )
 
 

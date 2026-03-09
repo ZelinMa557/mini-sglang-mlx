@@ -4,9 +4,12 @@ from typing import TYPE_CHECKING, List
 
 import mlx.core as mx
 from mlx_serve.message import TokenizeMsg
+from mlx_serve.utils import init_logger
 
 if TYPE_CHECKING:
     from transformers import LlamaTokenizer
+
+logger = init_logger(__name__)
 
 
 class TokenizeManager:
@@ -15,7 +18,6 @@ class TokenizeManager:
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[mx.array]:
         results: List[mx.array] = []
-        # TODO: batch tokenization
         for msg in msgs:
             if isinstance(msg.text, list):
                 prompt = self.tokenizer.apply_chat_template(
@@ -28,6 +30,11 @@ class TokenizeManager:
                 prompt = msg.text
             input_ids: mx.array = mx.array(  # type: ignore
                 self.tokenizer.encode(prompt, return_tensors="np")  
+            )
+            prompt_preview = prompt[:200] + ("..." if len(prompt) > 200 else "")
+            logger.info(
+                "[Tokenize] uid=%d  tokens=%d  prompt=%r",
+                msg.uid, len(input_ids[0]), prompt_preview,
             )
             results.append(input_ids[0])
         return results

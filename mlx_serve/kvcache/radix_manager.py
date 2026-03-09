@@ -3,13 +3,16 @@ from __future__ import annotations
 import heapq
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Tuple
 
 import mlx.core as mx
 
 from mlx_serve_kernel import fast_compare_key
 
 from .base import BaseCacheHandle, BaseCacheManager, SizeInfo
+
+if TYPE_CHECKING:
+    from .mamba_pool import MambaStatePool
 
 
 class RadixTreeNode:
@@ -22,6 +25,10 @@ class RadixTreeNode:
         self.uuid = RadixTreeNode.counter
         RadixTreeNode.counter += 1
         self.timestamp = tic or time.monotonic_ns()
+
+        # mamba state: slot index into MambaStatePool, or None for
+        # pure-attention models / interior nodes after a split ("tombstone").
+        self.mamba_slot: int | None = None
 
         # these fields should be updated later
         self._key: mx.array
@@ -71,6 +78,8 @@ class RadixTreeNode:
         new_node.set_key_value(self._key[:pos], self._value[:pos])
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
+        # mamba state is not splittable — it stays on the child (self).
+        # The new parent node becomes a tombstone (mamba_slot = None).
 
         self.set_key_value(self._key[pos:], self._value[pos:])
         self.set_parent(new_node)
@@ -97,7 +106,7 @@ class RadixCacheManager(BaseCacheManager):
         self.protected_size = 0
 
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
-        assert isinstance(handle, RadixCacheHandle)
+        assert isinstance(handle, (RadixCacheHandle, HybridCacheHandle))
         node = handle.node
         if unlock:
             while not node.is_root():
@@ -225,3 +234,135 @@ class RadixCacheManager(BaseCacheManager):
 
     def check_integrity(self) -> None:
         pass
+
+
+# ── Hybrid Mamba-Attention support ──────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class HybridCacheHandle(BaseCacheHandle):
+    """Cache handle for hybrid models: KV node + mamba state info."""
+
+    node: RadixTreeNode
+    mamba_slot: int | None  # slot in MambaStatePool that was forked for this request
+
+
+class HybridRadixCacheManager(RadixCacheManager):
+    """Radix cache that co-manages KV page indices and Mamba state slots.
+
+    For hybrid Mamba-Attention models, each radix tree leaf may carry a
+    ``mamba_slot`` pointing into a :class:`MambaStatePool`.  When a new
+    request matches a prefix, the manager finds the deepest node that has
+    both KV cache and a valid mamba slot, forks the mamba state, and returns
+    a :class:`HybridCacheHandle`.
+    """
+
+    def __init__(self, mamba_pool: MambaStatePool, device: None = None) -> None:
+        super().__init__(device=device)
+        self.mamba_pool = mamba_pool
+
+    # ── prefix matching ─────────────────────────────────────────────────
+
+    def match_prefix(
+        self, input_ids: mx.array
+    ) -> Tuple[HybridCacheHandle, mx.array]:
+        node, prefix_len = self._walk(input_ids)
+
+        mamba_node, mamba_depth = self._find_mamba_ancestor(node, prefix_len)
+        effective_len = mamba_depth
+
+        forked_slot: int | None = None
+        if mamba_node.mamba_slot is not None and effective_len > 0:
+            forked_slot = self.mamba_pool.alloc()
+            if forked_slot is not None:
+                self.mamba_pool.copy(mamba_node.mamba_slot, forked_slot)
+            else:
+                effective_len = 0
+                mamba_node = self.root_node
+
+        if effective_len == 0:
+            return HybridCacheHandle(0, self.root_node, forked_slot), self.empty_tensor
+
+        value_list: List[mx.array] = []
+        walk = mamba_node
+        while not walk.is_root():
+            value_list.append(walk.value)
+            walk = walk.parent
+        value_list.reverse()
+        return (
+            HybridCacheHandle(effective_len, mamba_node, forked_slot),
+            mx.concatenate(value_list),
+        )
+
+    def _find_mamba_ancestor(
+        self, node: RadixTreeNode, depth: int
+    ) -> Tuple[RadixTreeNode, int]:
+        """Walk up from *node* to find the nearest ancestor with mamba state."""
+        cur = node
+        cur_depth = depth
+        while not cur.is_root():
+            if cur.mamba_slot is not None:
+                return cur, cur_depth
+            cur_depth -= cur.length
+            cur = cur.parent
+        return self.root_node, 0
+
+    # ── insertion ────────────────────────────────────────────────────────
+
+    def insert_prefix(
+        self,
+        input_ids: mx.array,
+        indices: mx.array,
+        mamba_slot: int | None = None,
+    ) -> int:
+        node, prefix_len = self._walk(input_ids)
+        assert prefix_len <= len(input_ids)
+        if prefix_len < len(input_ids):
+            new_node = RadixTreeNode()
+            new_node.set_key_value(
+                input_ids[prefix_len:], mx.reshape(indices[prefix_len:], (-1,))
+            )
+            new_node.set_parent(node)
+            new_node.mamba_slot = mamba_slot
+            self.evictable_size += new_node.length
+        else:
+            if node.mamba_slot is None and mamba_slot is not None:
+                node.mamba_slot = mamba_slot
+            elif mamba_slot is not None:
+                self.mamba_pool.free(mamba_slot)
+        return prefix_len
+
+    # ── eviction ─────────────────────────────────────────────────────────
+
+    def evict(self, size: int) -> mx.array:
+        if size == 0:
+            return self.empty_tensor
+        assert (
+            size <= self.evictable_size
+        ), f"Cannot evict {size}, only {self.evictable_size} is evictable"
+
+        leave_nodes = self._collect_leave_nodes_for_evict()
+        heapq.heapify(leave_nodes)
+        evicted_indices: List[mx.array] = []
+        evicted_size = 0
+
+        while evicted_size < size:
+            assert (
+                leave_nodes
+            ), f"Cannot evict enough cache, need {size}, only {evicted_size} evicted"
+            node = heapq.heappop(leave_nodes)
+            assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
+            evicted_size += node.length
+            evicted_indices.append(node.value)
+            self.evictable_size -= node.length
+
+            if node.mamba_slot is not None:
+                self.mamba_pool.free(node.mamba_slot)
+                node.mamba_slot = None
+
+            parent = node.parent
+            del parent.children[int(node._key[0].item())]
+            if parent.is_leaf() and parent.ref_count == 0:
+                heapq.heappush(leave_nodes, parent)
+
+        return mx.concatenate(evicted_indices)

@@ -73,10 +73,21 @@ class PrefillAdder:
         CLS = ChunkedReq if is_chunked else Req
         self.token_budget -= chunk_size
         self.reserved_size += remain_len + pending_req.output_len
-        # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
         device_ids = self.table_manager.token_pool[table_idx][_slice]
         device_ids[:] = pending_req.input_ids[_slice]
+
+        mamba_slot: int | None = None
+        from mlx_serve.kvcache.radix_manager import HybridCacheHandle
+
+        if isinstance(cache_handle, HybridCacheHandle):
+            mamba_slot = cache_handle.mamba_slot
+            if mamba_slot is None:
+                from .cache import HybridCacheManager
+                assert isinstance(self.cache_manager, HybridCacheManager)
+                mamba_slot = self.cache_manager.mamba_pool.alloc()
+                assert mamba_slot is not None, "No mamba slots available"
+
         return CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -85,6 +96,7 @@ class PrefillAdder:
             uid=pending_req.uid,
             cache_handle=cache_handle,
             sampling_params=pending_req.sampling_params,
+            mamba_slot=mamba_slot,
         )
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:

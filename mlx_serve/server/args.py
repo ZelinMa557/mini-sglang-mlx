@@ -185,7 +185,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     if (dtype_str := kwargs["dtype"]) != "auto":
         kwargs["dtype"] = DTYPE_MAP[dtype_str]
     else:
-        dtype_or_str = getattr(cached_load_hf_config(kwargs["model_path"]), "torch_dtype", None)
+        hf_cfg = cached_load_hf_config(kwargs["model_path"])
+        dtype_or_str = getattr(hf_cfg, "torch_dtype", None)
+        if dtype_or_str is None:
+            tc = getattr(hf_cfg, "text_config", None)
+            if tc is not None:
+                dtype_or_str = getattr(tc, "dtype", None)
         dtype_name = str(dtype_or_str).lower() if dtype_or_str is not None else ""
         if "bfloat16" in dtype_name:
             kwargs["dtype"] = mx.bfloat16

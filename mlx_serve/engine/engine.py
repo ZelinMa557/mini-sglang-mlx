@@ -39,18 +39,25 @@ class _ModelMeta:
 
     @staticmethod
     def from_hf_config(hf_config: Dict[str, Any]) -> "_ModelMeta":
+        tc = hf_config.get("text_config", hf_config)
         head_dim = int(
-            hf_config.get("head_dim")
-            or hf_config["hidden_size"] // hf_config["num_attention_heads"]
+            tc.get("head_dim")
+            or tc["hidden_size"] // tc["num_attention_heads"]
         )
+        total_layers = int(tc.get("num_hidden_layers", tc.get("num_layers")))
+        interval = int(tc.get("full_attention_interval", 0))
+        if interval > 0:
+            num_kv_layers = total_layers // interval
+        else:
+            num_kv_layers = total_layers
         return _ModelMeta(
             head_dim=head_dim,
             num_kv_heads=int(
-                hf_config.get("num_key_value_heads", hf_config["num_attention_heads"])
+                tc.get("num_key_value_heads", tc["num_attention_heads"])
             ),
-            num_layers=int(hf_config.get("num_hidden_layers", hf_config.get("num_layers"))),
-            vocab_size=int(hf_config["vocab_size"]),
-            max_position=int(hf_config.get("max_position_embeddings", 8192)),
+            num_layers=num_kv_layers,
+            vocab_size=int(tc["vocab_size"]),
+            max_position=int(tc.get("max_position_embeddings", 8192)),
         )
 
 
@@ -83,7 +90,21 @@ class Engine:
             kvcache=self.kv_cache,
             page_table=self.page_table,
         )
-        self.ctx = Context(page_size=1, attn_backend=self.attn_backend)
+
+        self.is_hybrid = getattr(self.model, "is_hybrid", False)
+        self.mamba_pool = None
+        self.gdn_backend = None
+        if self.is_hybrid:
+            self.mamba_pool = self._create_mamba_pool(config)
+            from mlx_serve.attention import GDNBackend
+            self.gdn_backend = GDNBackend(self.mamba_pool)
+
+        self.ctx = Context(
+            page_size=1,
+            attn_backend=self.attn_backend,
+            mamba_pool=self.mamba_pool,
+            gdn_backend=self.gdn_backend,
+        )
         set_global_ctx(self.ctx)
         self.sampler = Sampler(self.model_meta.vocab_size)
 
@@ -97,6 +118,21 @@ class Engine:
             cache_handle=None,  # type: ignore
         )
         self.page_table[self.dummy_req.table_idx, :] = self.dummy_page
+
+    def _create_mamba_pool(self, config: EngineConfig):
+        from mlx_serve.kvcache.mamba_pool import MambaStateConfig, MambaStatePool
+
+        conv_shapes, temporal_shapes = self.model.get_linear_state_shapes()
+        num_linear_layers = len(conv_shapes)
+        num_slots = config.max_running_req * 2
+        pool_config = MambaStateConfig(
+            num_slots=num_slots,
+            num_layers=num_linear_layers,
+            conv_shapes=conv_shapes,
+            temporal_shapes=temporal_shapes,
+            dtype=self.dtype,
+        )
+        return MambaStatePool(pool_config)
 
     def _determine_num_pages(self, config: EngineConfig) -> int:
         bytes_per_page = (

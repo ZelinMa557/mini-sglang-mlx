@@ -6,12 +6,14 @@ import mlx.core as mx
 from mlx_serve.kvcache import BaseCacheHandle, create_cache_manager
 
 if TYPE_CHECKING:
+    from mlx_serve.kvcache.mamba_pool import MambaStatePool
+    from mlx_serve.kvcache.radix_manager import HybridRadixCacheManager
+
     from .utils import PendingReq
 
 
 class CacheManager:
     def __init__(self, device: None, num_pages: int, type: str):
-        # TODO: support page_size > 1
         self._free_slots = mx.arange(num_pages, dtype=mx.int32)
         self.device = device
         self.manager = create_cache_manager(device=device, type=type)
@@ -42,7 +44,6 @@ class CacheManager:
             self._free_slots = self._free_slots[needed_len:]
             return allocated
 
-        # NOTE: len(evicted) + free_len >= needed_len
         evicted = self.manager.evict(needed_len - free_len)
         merged = mx.concatenate([self._free_slots, evicted])
         assert len(merged) >= needed_len, "Eviction did not free enough space."
@@ -56,8 +57,17 @@ class CacheManager:
         old_handle: BaseCacheHandle,
         input_ids: mx.array,
         indices: mx.array,
+        mamba_slot: int | None = None,
     ) -> None:
-        in_cache_len = self.manager.insert_prefix(input_ids, indices)
+        if mamba_slot is not None:
+            from mlx_serve.kvcache.radix_manager import HybridRadixCacheManager
+
+            assert isinstance(self.manager, HybridRadixCacheManager)
+            in_cache_len = self.manager.insert_prefix(
+                input_ids, indices, mamba_slot=mamba_slot
+            )
+        else:
+            in_cache_len = self.manager.insert_prefix(input_ids, indices)
         self._free(indices[old_handle.cached_len : in_cache_len])
         self.unlock(old_handle)
 
@@ -69,3 +79,27 @@ class CacheManager:
                 f" free_slots({len(self._free_slots)}) +"
                 f" total_size({self.manager.size_info.total_size}) != num_pages({self.num_pages})"
             )
+
+
+class HybridCacheManager(CacheManager):
+    """CacheManager that also manages MambaStatePool for hybrid models."""
+
+    def __init__(
+        self,
+        device: None,
+        num_pages: int,
+        mamba_pool: "MambaStatePool",
+    ):
+        self._free_slots = mx.arange(num_pages, dtype=mx.int32)
+        self.device = device
+        self.num_pages = num_pages
+        self.mamba_pool = mamba_pool
+
+        from mlx_serve.kvcache import create_hybrid_radix_cache_manager
+
+        self.manager = create_hybrid_radix_cache_manager(
+            mamba_pool=mamba_pool, device=device
+        )
+
+    def free_mamba_slot(self, slot: int) -> None:
+        self.mamba_pool.free(slot)
