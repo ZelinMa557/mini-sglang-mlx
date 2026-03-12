@@ -162,14 +162,12 @@ class GatedDeltaNet(nn.Module):
     def temporal_state_shape(self) -> tuple:
         return (self.num_v_heads, self.head_v_dim, self.head_k_dim)
 
-    def _apply_conv_per_request(
+    def _apply_conv_prefill(
         self, qkv: mx.array, batch: "Batch", mamba_pool: "MambaStatePool",
     ) -> mx.array:
         """Per-request depthwise conv1d using conv state from pool."""
         conv_buf = mamba_pool.conv_state(self.linear_layer_idx)
-        K = self.conv_kernel_size
-        # weight shape: [conv_dim, kernel_size, 1] -> squeeze to [conv_dim, K] -> T -> [K, conv_dim]
-        w = self.conv1d.weight[:, :, 0].T  # [K, conv_dim]
+        state_len = self.conv_kernel_size - 1
 
         output_parts: List[mx.array] = []
         offset = 0
@@ -180,40 +178,29 @@ class GatedDeltaNet(nn.Module):
             offset += seg_len
 
             slot = req.mamba_slot
+            assert slot is not None
             conv_state = conv_buf[slot]  # [K-1, conv_dim]
             conv_input = mx.concatenate([conv_state, qkv_seg], axis=0)
-            conv_buf[slot] = conv_input[-(K - 1) :]
+            conv_buf[slot] = conv_input[-state_len:]
 
-            parts = []
-            for t in range(seg_len):
-                window = conv_input[t : t + K]       # [K, conv_dim]
-                out_t = (window * w).sum(axis=0)      # [conv_dim]
-                parts.append(out_t)
-            output_parts.append(mx.stack(parts, axis=0))
+            conv_out = self.conv1d(conv_input[None, :, :])[0]
+            output_parts.append(nn.silu(conv_out))
 
-        return nn.silu(mx.concatenate(output_parts, axis=0))
+        return mx.concatenate(output_parts, axis=0)
 
     def _apply_conv_decode(
         self, qkv: mx.array, batch: "Batch", mamba_pool: "MambaStatePool",
     ) -> mx.array:
         """Batched depthwise conv1d for decode (1 token per request)."""
+        assert batch.mamba_slot_ids is not None
         conv_buf = mamba_pool.conv_state(self.linear_layer_idx)
-        K = self.conv_kernel_size
-        w = self.conv1d.weight[:, :, 0].T  # [K, conv_dim]
+        state_len = self.conv_kernel_size - 1
+        conv_state = conv_buf[batch.mamba_slot_ids]  # [B, K-1, conv_dim]
+        conv_input = mx.concatenate([conv_state, qkv[:, None, :]], axis=1)
+        conv_buf[batch.mamba_slot_ids] = conv_input[:, -state_len:, :]
 
-        output_parts: List[mx.array] = []
-
-        for i, req in enumerate(batch.reqs):
-            slot = req.mamba_slot
-            conv_state = conv_buf[slot]          # [K-1, conv_dim]
-            token = qkv[i : i + 1]               # [1, conv_dim]
-            conv_input = mx.concatenate([conv_state, token], axis=0)  # [K, conv_dim]
-            conv_buf[slot] = conv_input[-(K - 1) :]
-
-            out_t = (conv_input * w).sum(axis=0)  # [conv_dim]
-            output_parts.append(out_t)
-
-        return nn.silu(mx.stack(output_parts, axis=0))  # [B, conv_dim]
+        conv_out = self.conv1d(conv_input)  # [B, 1, conv_dim]
+        return nn.silu(conv_out[:, 0, :])
 
     def __call__(self, x: mx.array) -> mx.array:
         ctx = get_global_ctx()
@@ -230,9 +217,10 @@ class GatedDeltaNet(nn.Module):
         a = self.in_proj_a(x)                                  # [L, Hv]
 
         if batch.is_decode:
+            gdn_backend.prepare_batch(batch)
             conv_out = self._apply_conv_decode(mixed_qkv, batch, mamba_pool)
         else:
-            conv_out = self._apply_conv_per_request(mixed_qkv, batch, mamba_pool)
+            conv_out = self._apply_conv_prefill(mixed_qkv, batch, mamba_pool)
 
         q = conv_out[:, : self.key_dim].reshape(L, self.num_k_heads, self.head_k_dim)
         k = conv_out[:, self.key_dim : 2 * self.key_dim].reshape(L, self.num_k_heads, self.head_k_dim)
@@ -245,11 +233,12 @@ class GatedDeltaNet(nn.Module):
         beta = mx.sigmoid(b)
         g = compute_gate(self.A_log, a, self.dt_bias)
 
-        return gdn_backend.forward(
-            q, k, v, g, beta, z,
-            self.norm, self.out_proj,
+        y = gdn_backend.forward(
+            q, k, v, g, beta,
             self.linear_layer_idx, batch,
         )
+        y = self.norm(y, z)
+        return self.out_proj(y.reshape(L, -1))
 
 
 class DecoderLayer(nn.Module):

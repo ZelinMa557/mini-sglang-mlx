@@ -77,6 +77,7 @@ class Batch:
     padded_reqs: List[Req] = field(init=False)  # may contain some dummy reqs for padding
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
+    mamba_slot_ids: mx.array | None = field(default=None, init=False, repr=False)
 
     @property
     def is_prefill(self) -> bool:

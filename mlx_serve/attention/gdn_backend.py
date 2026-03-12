@@ -3,6 +3,10 @@
 Mirrors :class:`AttnBackend` but manages recurrent state (conv + temporal)
 instead of paged KV cache.  Separates prefill (variable-length sequential
 recurrence) from decode (batched single-step Metal kernel).
+
+The backend only handles the recurrence — norm and output projection stay
+in the model layer, mirroring how :class:`AttnBackend` returns raw attention
+output and lets the :class:`Attention` layer apply ``o_proj``.
 """
 
 from __future__ import annotations
@@ -10,7 +14,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List
 
 import mlx.core as mx
-import mlx.nn as nn
 
 if TYPE_CHECKING:
     from mlx_serve.core import Batch, Req
@@ -209,6 +212,16 @@ class GDNBackend:
 
     # ── public API called by GatedDeltaNet layer ──────────────────────
 
+    def prepare_batch(self, batch: "Batch") -> None:
+        """Prepare decode-only metadata shared by all linear layers."""
+        if batch.is_prefill or batch.mamba_slot_ids is not None:
+            return
+
+        slots = [req.mamba_slot for req in batch.reqs]
+        assert all(slot is not None for slot in slots), "Missing mamba slot"
+        batch.mamba_slot_ids = mx.array(slots, dtype=mx.int32)
+        mx.eval(batch.mamba_slot_ids)
+
     def forward(
         self,
         q: mx.array,
@@ -216,24 +229,25 @@ class GDNBackend:
         v: mx.array,
         g: mx.array,
         beta: mx.array,
-        z: mx.array,
-        norm: nn.Module,
-        out_proj: nn.Module,
         linear_layer_idx: int,
         batch: "Batch",
     ) -> mx.array:
         """Run GDN recurrence for one layer across the batch.
 
+        Returns raw recurrence output ``y`` of shape ``[L, Hv, Dv]``.
+        The caller is responsible for norm and output projection.
+
         Prefill: q/k/v/g/beta are ragged [total_tokens, ...].
         Decode:  q/k/v/g/beta are ragged [B, ...] (1 token each).
         """
+        self.prepare_batch(batch)
         if batch.is_prefill:
             return self._forward_prefill(
-                q, k, v, g, beta, z, norm, out_proj, linear_layer_idx, batch,
+                q, k, v, g, beta, linear_layer_idx, batch,
             )
         else:
             return self._forward_decode(
-                q, k, v, g, beta, z, norm, out_proj, linear_layer_idx, batch,
+                q, k, v, g, beta, linear_layer_idx, batch,
             )
 
     # ── prefill: sequential per-request recurrence ────────────────────
@@ -245,9 +259,6 @@ class GDNBackend:
         v: mx.array,
         g: mx.array,
         beta: mx.array,
-        z: mx.array,
-        norm: nn.Module,
-        out_proj: nn.Module,
         linear_layer_idx: int,
         batch: "Batch",
     ) -> mx.array:
@@ -266,7 +277,6 @@ class GDNBackend:
             v_seg = v[offset : offset + seg_len]
             g_seg = g[offset : offset + seg_len]
             beta_seg = beta[offset : offset + seg_len]
-            z_seg = z[offset : offset + seg_len]
 
             state = temporal_buf[slot]
             ys = []
@@ -277,11 +287,7 @@ class GDNBackend:
                 ys.append(y_t)
 
             temporal_buf[slot] = state
-
-            y = mx.stack(ys, axis=0)                # [S, Hv, Dv]
-            y = norm(y, z_seg)                       # [S, Hv, Dv]
-            y = out_proj(y.reshape(seg_len, -1))     # [S, D]
-            output_parts.append(y)
+            output_parts.append(mx.stack(ys, axis=0))  # [S, Hv, Dv]
             offset += seg_len
 
         return mx.concatenate(output_parts, axis=0)
@@ -295,25 +301,14 @@ class GDNBackend:
         v: mx.array,
         g: mx.array,
         beta: mx.array,
-        z: mx.array,
-        norm: nn.Module,
-        out_proj: nn.Module,
         linear_layer_idx: int,
         batch: "Batch",
     ) -> mx.array:
-        reqs = batch.reqs
-        B = len(reqs)
+        assert batch.mamba_slot_ids is not None
         temporal_buf = self.mamba_pool.temporal_state(linear_layer_idx)
+        state_batch = temporal_buf[batch.mamba_slot_ids]  # [B, Hv, Dv, Dk]
 
-        slots = mx.array([req.mamba_slot for req in reqs], dtype=mx.int32)
-        state_batch = temporal_buf[slots]  # [B, Hv, Dv, Dk]
-
-        # q/k/v/g/beta are already [B, ...] (one token per req in decode)
         y, new_state = _gated_delta_decode_kernel(q, k, v, g, beta, state_batch)
 
-        # Scatter new state back into the pool
-        for i, req in enumerate(reqs):
-            temporal_buf[req.mamba_slot] = new_state[i]
-
-        y = norm(y, z)
-        return out_proj(y.reshape(B, -1))
+        temporal_buf[batch.mamba_slot_ids] = new_state
+        return y
