@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Tuple
 
 import mlx.core as mx
@@ -16,6 +17,7 @@ class ServerArgs(SchedulerConfig):
     server_port: int = 1919
     num_tokenizer: int = 0
     silent_output: bool = False
+    use_modelscope: bool = False
 
     @property
     def share_tokenizer(self) -> bool:
@@ -69,6 +71,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         type=str,
         required=True,
         help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+    )
+
+    parser.add_argument(
+        "--use-modelscope",
+        action="store_true",
+        help=(
+            "Download remote model repos via ModelScope instead of HuggingFace. "
+            "Useful in regions where HuggingFace access is slow."
+        ),
     )
 
     parser.add_argument(
@@ -176,6 +187,18 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
+
+    if kwargs["use_modelscope"]:
+        model_path = Path(kwargs["model_path"])
+        if not model_path.is_dir():
+            try:
+                from modelscope.hub.snapshot_download import snapshot_download
+            except ImportError as e:
+                raise RuntimeError(
+                    "--use-modelscope requires the `modelscope` package. "
+                    "Please install it with: pip install modelscope"
+                ) from e
+            kwargs["model_path"] = snapshot_download(kwargs["model_path"])
 
     DTYPE_MAP = {
         "float16": mx.float16,
