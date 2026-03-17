@@ -28,15 +28,17 @@ find_package(MLX CONFIG REQUIRED)
 
 # ----------------------------- Extensions -----------------------------
 
+# Auto-discover kernel sources so new files don't require CMake edits.
+file(
+  GLOB KERNEL_CPP_SOURCES CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_LIST_DIR}/csrc/*.cpp")
+list(REMOVE_ITEM KERNEL_CPP_SOURCES "${CMAKE_CURRENT_LIST_DIR}/csrc/bindings.cpp")
+
 # Add library
 add_library(mlx_serve_kernel)
 
 # Add sources
-target_sources(mlx_serve_kernel PUBLIC ${CMAKE_CURRENT_LIST_DIR}/csrc/moe_utils.cpp
-                                       ${CMAKE_CURRENT_LIST_DIR}/csrc/store_kv_cache.cpp
-                                       ${CMAKE_CURRENT_LIST_DIR}/csrc/fast_compare_key.cpp
-                                       ${CMAKE_CURRENT_LIST_DIR}/csrc/paged_decode_attention.cpp
-                                       ${CMAKE_CURRENT_LIST_DIR}/csrc/paged_prefill_attention.cpp)
+target_sources(mlx_serve_kernel PUBLIC ${KERNEL_CPP_SOURCES})
 
 # Add include headers
 target_include_directories(mlx_serve_kernel PUBLIC ${CMAKE_CURRENT_LIST_DIR}/csrc)
@@ -46,6 +48,10 @@ target_link_libraries(mlx_serve_kernel PUBLIC mlx)
 
 # ----------------------------- Metal -----------------------------
 
+file(
+  GLOB KERNEL_METAL_SOURCES CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_LIST_DIR}/csrc/*.metal")
+
 # Build metallib
 if(MLX_BUILD_METAL)
   mlx_build_metallib(
@@ -54,10 +60,7 @@ if(MLX_BUILD_METAL)
     TITLE
     mlx_serve_kernel
     SOURCES
-    ${CMAKE_CURRENT_LIST_DIR}/csrc/moe_utils.metal
-    ${CMAKE_CURRENT_LIST_DIR}/csrc/store_kv_cache.metal
-    ${CMAKE_CURRENT_LIST_DIR}/csrc/paged_decode_attention.metal
-    ${CMAKE_CURRENT_LIST_DIR}/csrc/paged_prefill_attention.metal
+    ${KERNEL_METAL_SOURCES}
     INCLUDE_DIRS
     ${PROJECT_SOURCE_DIR}
     ${MLX_INCLUDE_DIRS}

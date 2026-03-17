@@ -200,7 +200,7 @@ class GatedDeltaNet(nn.Module):
         conv_buf[batch.mamba_slot_ids] = conv_input[:, -state_len:, :]
 
         conv_out = self.conv1d(conv_input)  # [B, 1, conv_dim]
-        return nn.silu(conv_out[:, 0, :])
+        return nn.silu(conv_out.squeeze(axis=1))
 
     def __call__(self, x: mx.array) -> mx.array:
         ctx = get_global_ctx()
