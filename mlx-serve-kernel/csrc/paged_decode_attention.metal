@@ -137,6 +137,7 @@ template <
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ---- QK^T using simdgroup_matrix<T> ----
+
     {
       constexpr int N_TILES = BLOCK_N / 8;
       constexpr int TILES_PER_SG = (N_TILES + NSG - 1) / NSG;
@@ -256,6 +257,7 @@ template <
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
+
 
   // ---- Store partial results ----
   const int out_stride_batch = num_q_heads * max_kv_splits * DV;

@@ -23,11 +23,6 @@ NB_MODULE(_ext, m) {
         nb::sig(
             "def moe_sum_reduce_with_reorder(y: array, scores: array, "
             "inv_order: array, *, stream: Union[None, Stream, Device] = None) -> array"));
-  m.def("moe_scatter_broadcast", &mlx_serve::moe_scatter_broadcast,
-        "x"_a, "inv_order"_a, "topk_num"_a, nb::kw_only(), "stream"_a = nb::none(),
-        nb::sig(
-            "def moe_scatter_broadcast(x: array, inv_order: array, topk_num: int, *, "
-            "stream: Union[None, Stream, Device] = None) -> array"));
   m.def("store_kv_cache", &mlx_serve::store_kv_cache,
         "k_cache"_a, "v_cache"_a, "indices"_a, "k"_a, "v"_a,
         nb::kw_only(), "stream"_a = nb::none(),

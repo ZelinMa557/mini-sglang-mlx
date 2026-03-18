@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_serve.layers.activations import swiglu
-from mlx_serve_kernel import moe_scatter_broadcast, moe_sum_reduce, moe_sum_reduce_with_reorder
+from mlx_serve_kernel import moe_sum_reduce, moe_sum_reduce_with_reorder
 
 
 class SwiGLU(nn.Module):
@@ -25,18 +25,16 @@ def _gather_sort(x, indices):
     Returns:
         x_sorted: [L*K, 1, D] tokens reordered by expert
         idx_sorted: [L*K] sorted expert indices
-        inv_order: [L*K] inverse permutation (uint32, for fused kernels)
+        inv_order: [L*K] inverse permutation (used by reorder reduce kernel)
     """
     *_, M = indices.shape
     indices = indices.flatten()
     order = mx.argsort(indices)
     inv_order = mx.argsort(order)
     x_flat = x.flatten(0, -3)  # [L, 1, D]
-    x_sorted = moe_scatter_broadcast(
-        x_flat.squeeze(-2),    # [L, D]
-        inv_order.astype(mx.uint32),
-        M
-    )                          # [L*K, D]
+    # Equivalent to the removed fused kernel path:
+    # out[inv_order[t*K + k]] = x[t]  <=>  out = x[order // K]
+    x_sorted = x_flat.squeeze(-2)[order // M]  # [L*K, D]
     x_sorted = mx.expand_dims(x_sorted, -2)  # [L*K, 1, D]
     return x_sorted, indices[order], inv_order
 

@@ -53,7 +53,7 @@ def build_paged_decode_inputs(
     kv_indices = mx.array(np.arange(total_kv, dtype=np.int32))
 
     # num_kv_splits
-    max_kv_splits = 16
+    max_kv_splits = 32
     splits = []
     for l in kv_lens:
         s = min(max_kv_splits, max(1, (l + 127) // 128))

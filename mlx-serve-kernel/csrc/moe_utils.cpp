@@ -87,39 +87,6 @@ mx::array moe_sum_reduce_with_reorder(
       {y, scores, inv_order});
 }
 
-mx::array moe_scatter_broadcast(
-    const mx::array& x,
-    const mx::array& inv_order,
-    int topk_num,
-    mx::StreamOrDevice s_
-) {
-  auto out_type = x.dtype();
-  auto s = to_stream(s_);
-
-  if (x.ndim() != 2) {
-    throw std::runtime_error("moe_scatter_broadcast: x must be 2D [token_num, hidden_dim]");
-  }
-  if (inv_order.ndim() != 1) {
-    throw std::runtime_error("moe_scatter_broadcast: inv_order must be 1D [token_num * topk_num]");
-  }
-
-  const size_t token_num = x.shape(0);
-  const size_t hidden_dim = x.shape(1);
-
-  if (inv_order.shape(0) != static_cast<int>(token_num * topk_num)) {
-    throw std::runtime_error("moe_scatter_broadcast: inv_order length must equal token_num * topk_num");
-  }
-  if (inv_order.dtype() != mx::uint32) {
-    throw std::runtime_error("moe_scatter_broadcast: inv_order must be uint32");
-  }
-
-  return mx::array(
-      {static_cast<int>(token_num * topk_num), static_cast<int>(hidden_dim)},
-      out_type,
-      std::make_shared<MoeScatterBroadcast>(s, topk_num),
-      {x, inv_order});
-}
-
 #ifdef _METAL_
 void MoeSumReduce::eval_gpu(
     const std::vector<mx::array>& inputs,
@@ -223,51 +190,6 @@ void MoeSumReduceWithReorder::eval_gpu(
   MTL::Size group_dims = MTL::Size(1,1,1);
   MTL::Size grid_dims = MTL::Size(dim0, dim1, dim2);
   compute_encoder.dispatch_threads(grid_dims, group_dims);
-}
-
-void MoeScatterBroadcast::eval_gpu(
-    const std::vector<mx::array>& inputs,
-    std::vector<mx::array>& outputs) {
-  auto& s = stream();
-  auto& d = mx::metal::device(s.device);
-  auto& out = outputs[0];
-
-  const mx::array& x = inputs[0];
-  const mx::array& inv_order = inputs[1];
-
-  const uint32_t token_num = static_cast<uint32_t>(x.shape(0));
-  const uint32_t hidden_dim = static_cast<uint32_t>(x.shape(1));
-  const uint32_t topk_num = static_cast<uint32_t>(topk_num_);
-
-  const uint32_t x_stride_row = static_cast<uint32_t>(x.strides()[0]);
-  const uint32_t out_stride_row = static_cast<uint32_t>(out.strides()[0]);
-
-  const int n_reads = 4;
-  if (hidden_dim % n_reads != 0) {
-    throw std::runtime_error("moe_scatter_broadcast: hidden_dim must be divisible by 4");
-  }
-
-  std::string op_name = "moe_scatter_broadcast_" + type_to_name(out);
-  auto lib = d.get_library("mlx_serve_kernel", util::current_binary_dir());
-  auto kernel = d.get_kernel(op_name, lib);
-
-  auto& compute_encoder = d.get_command_encoder(s.index);
-  out.set_data(mx::allocator::malloc(out.nbytes()));
-
-  compute_encoder.set_compute_pipeline_state(kernel);
-  compute_encoder.set_input_array(x, 0);
-  compute_encoder.set_input_array(inv_order, 1);
-  compute_encoder.set_output_array(out, 2);
-  compute_encoder.set_bytes(topk_num, 3);
-  compute_encoder.set_bytes(hidden_dim, 4);
-  compute_encoder.set_bytes(x_stride_row, 5);
-  compute_encoder.set_bytes(out_stride_row, 6);
-
-  // One threadgroup per src token, 256 threads per group
-  const uint32_t threads_per_group = 256;
-  MTL::Size group_dims = MTL::Size(threads_per_group, 1, 1);
-  MTL::Size grid_dims = MTL::Size(token_num, 1, 1);
-  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 #endif
 } // namespace mlx_serve
