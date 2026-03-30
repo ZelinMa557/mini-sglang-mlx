@@ -154,7 +154,6 @@ void PagedDecodeAttention::eval_gpu(
     constexpr size_t T_SIZE = 2; // sizeof(half) == sizeof(bfloat16_t)
     size_t shmem_size = BLOCK_H * head_dim_ * T_SIZE +         // sq
                         BLOCK_N * head_dim_ * T_SIZE +         // sk
-                        BLOCK_N * head_dim_ * T_SIZE +         // sv
                         BLOCK_H * BLOCK_N * sizeof(uint16_t) + // sp (half)
                         BLOCK_H * BLOCK_N * sizeof(float) +    // ss
                         BLOCK_H * head_dim_ * sizeof(float) +  // so
