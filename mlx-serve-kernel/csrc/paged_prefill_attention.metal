@@ -71,7 +71,7 @@ template <
   // s_esum: BLOCK_M floats
   threadgroup T* sq = (threadgroup T*)shmem_raw;
   threadgroup T* sk = sq + BLOCK_M * DK;
-  threadgroup T* sv = sk + BLOCK_N * DK;
+  threadgroup T* sv = sk;
   threadgroup half* sp = (threadgroup half*)(sv + BLOCK_N * DV);
   threadgroup float* ss = (threadgroup float*)(sp + BLOCK_M * BLOCK_N);
   threadgroup float* so = ss + BLOCK_M * BLOCK_N;

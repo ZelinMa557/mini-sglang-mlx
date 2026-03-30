@@ -143,7 +143,6 @@ void PagedPrefillAttention::eval_gpu(
   constexpr size_t T_SIZE = 2; // sizeof(half) == sizeof(bfloat16_t)
   size_t shmem_size = BLOCK_M * head_dim_ * T_SIZE +         // sq
                       BLOCK_N * head_dim_ * T_SIZE +         // sk
-                      BLOCK_N * head_dim_ * T_SIZE +         // sv
                       BLOCK_M * BLOCK_N * sizeof(uint16_t) + // sp (half)
                       BLOCK_M * BLOCK_N * sizeof(float) +    // ss
                       BLOCK_M * head_dim_ * sizeof(float) +  // so
