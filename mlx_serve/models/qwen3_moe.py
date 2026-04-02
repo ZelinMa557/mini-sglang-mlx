@@ -4,7 +4,6 @@ from typing import Any, Dict, List, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_serve.core import get_global_ctx
-from mlx_serve.layers.activations import swiglu
 from mlx_serve.layers.switch_linear import SwitchGLU
 
 from .base import BaseModelArgs

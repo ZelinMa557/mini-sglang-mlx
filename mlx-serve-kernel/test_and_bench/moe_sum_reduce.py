@@ -131,12 +131,12 @@ if __name__ == "__main__":
     mx.random.seed(128)
     # 定义要测试的不同输入形状
     test_cases = [
-        (1, 4, 2048),
+        (1, 8, 2048),
         (3, 8, 2048),
-        (32, 4, 2048),      # small batch, topk=4
-        (128, 4, 2048),     # medium batch, topk=4
+        (32, 8, 2048),      # small batch, topk=8
+        (128, 8, 2048),     # medium batch, topk=8
         (512, 8, 2048),     # large batch, topk=8
-        (1024, 4, 2048),    # large batch, large hidden
+        (1024, 8, 2048),    # large batch, large hidden
         (4096, 8, 2048),     # medium batch, medium hidden
     ]
     
