@@ -139,7 +139,7 @@ void PagedPrefillAttention::eval_gpu(
   // Shared memory size:
   // - Q block stays resident
   // - K/V are streamed as 32x32 tensor-op sub-tiles
-  constexpr int BLOCK_M = 8;
+  constexpr int BLOCK_M = 16;
   constexpr int BLOCK_N = 32;
   constexpr int NSG = 4;
   constexpr int MMA_K = 32;

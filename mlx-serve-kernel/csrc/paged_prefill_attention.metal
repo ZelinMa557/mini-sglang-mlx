@@ -4,6 +4,19 @@
 #include "mlx/backend/metal/kernels/utils.h"
 using namespace metal;
 
+template <typename T>
+using vec2_t = vec<T, 2>;
+
+template <typename T>
+METAL_FUNC inline void copy_vec2(
+    threadgroup T* dst,
+    int dst_idx,
+    const device T* src,
+    int src_idx) {
+  *((threadgroup vec2_t<T>*)(dst + dst_idx)) =
+      *((const device vec2_t<T>*)(src + src_idx));
+}
+
 // ============================================================================
 // Paged Prefill (Extend) Attention
 //
@@ -22,7 +35,7 @@ template <
     typename T,
     short DK,        // head key dimension
     short DV,        // head value dimension
-    short BLOCK_M,   // query tokens per threadgroup (8)
+    short BLOCK_M,   // query tokens per threadgroup (16)
     short BLOCK_N,   // KV tokens per inner loop iteration (32)
     short NSG>       // number of SIMD groups (4)
 [[kernel]] void paged_prefill_attention(
@@ -42,7 +55,7 @@ template <
     ushort tiisg  [[thread_index_in_simdgroup]],
     ushort sgitg  [[simdgroup_index_in_threadgroup]]) {
 
-  static_assert(BLOCK_M == 8, "paged_prefill_attention expects BLOCK_M == 8");
+  static_assert(BLOCK_M == 16, "paged_prefill_attention expects BLOCK_M == 16");
   static_assert(BLOCK_N == 32, "paged_prefill_attention expects BLOCK_N == 32");
   static_assert(NSG == 4, "paged_prefill_attention expects NSG == 4");
 
@@ -109,13 +122,23 @@ template <
   const int q_stride_head = DK;
   const int q_stride_token = num_q_heads * DK;
 
+  constexpr int VEC_WIDTH = 2;
+  constexpr int DK_VEC = DK / VEC_WIDTH;
+  constexpr int DV_VEC = DV / VEC_WIDTH;
+  constexpr int MMA_K_VEC = MMA_K / VEC_WIDTH;
+  constexpr int MMA_DV_VEC = MMA_DV / VEC_WIDTH;
+
   for (int m = 0; m < BLOCK_M; m++) {
-    for (int d = tid; d < DK; d += total_threads) {
+    for (int d2 = tid; d2 < DK_VEC; d2 += total_threads) {
+      const int d = d2 * VEC_WIDTH;
       if (m < valid_m) {
         int global_token = q_start + q_block_start + m;
-        sq[m * DK + d] = Q[global_token * q_stride_token + cur_head * q_stride_head + d];
+        copy_vec2(
+            sq, m * DK + d,
+            Q,
+            global_token * q_stride_token + cur_head * q_stride_head + d);
       } else {
-        sq[m * DK + d] = T(0);
+        *((threadgroup vec2_t<T>*)(sq + m * DK + d)) = vec2_t<T>(T(0), T(0));
       }
     }
   }
@@ -154,21 +177,32 @@ template <
 
     // ---- QK^T via tensor ops with streamed 8x32 / 32x32 sub-tiles ----
     for (int dk_base = 0; dk_base < DK; dk_base += MMA_K) {
-      for (int i = tid; i < BLOCK_M * MMA_K; i += total_threads) {
-        const int m = i / MMA_K;
-        const int k = i % MMA_K;
-        sqk[i] = (m < valid_m) ? sq[m * DK + dk_base + k] : T(0);
+      for (int i2 = tid; i2 < BLOCK_M * MMA_K_VEC; i2 += total_threads) {
+        const int m = i2 / MMA_K_VEC;
+        const int k2 = i2 % MMA_K_VEC;
+        const int k = k2 * VEC_WIDTH;
+        if (m < valid_m) {
+          *((threadgroup vec2_t<T>*)(sqk + m * MMA_K + k)) =
+              *((threadgroup vec2_t<T>*)(sq + m * DK + dk_base + k));
+        } else {
+          *((threadgroup vec2_t<T>*)(sqk + m * MMA_K + k)) =
+              vec2_t<T>(T(0), T(0));
+        }
       }
 
-      for (int i = tid; i < BLOCK_N * MMA_K; i += total_threads) {
-        const int token_local = i / MMA_K;
-        const int k = i % MMA_K;
+      for (int i2 = tid; i2 < BLOCK_N * MMA_K_VEC; i2 += total_threads) {
+        const int token_local = i2 / MMA_K_VEC;
+        const int k2 = i2 % MMA_K_VEC;
+        const int k = k2 * VEC_WIDTH;
         if (token_local < valid_n) {
           int page_idx = kv_indices[kv_start + kv_block_start + token_local];
-          st[i] = K_cache[page_idx * kv_cache_stride_k + cur_kv_head * DK +
-                          dk_base + k];
+          copy_vec2(
+              st, token_local * MMA_K + k,
+              K_cache,
+              page_idx * kv_cache_stride_k + cur_kv_head * DK + dk_base + k);
         } else {
-          st[i] = T(0);
+          *((threadgroup vec2_t<T>*)(st + token_local * MMA_K + k)) =
+              vec2_t<T>(T(0), T(0));
         }
       }
 
@@ -250,21 +284,27 @@ template <
 
     // ---- P @ V via tensor ops with streamed 32x32 V sub-tiles ----
     for (int dv_base = 0; dv_base < DV; dv_base += MMA_DV) {
-      for (int i = tid; i < BLOCK_M * MMA_DV; i += total_threads) {
-        const int m = i / MMA_DV;
-        const int d = i % MMA_DV;
-        so_tile[i] = so[m * DV + dv_base + d];
+      for (int i2 = tid; i2 < BLOCK_M * MMA_DV_VEC; i2 += total_threads) {
+        const int m = i2 / MMA_DV_VEC;
+        const int d2 = i2 % MMA_DV_VEC;
+        const int d = d2 * VEC_WIDTH;
+        *((threadgroup float2*)(so_tile + m * MMA_DV + d)) =
+            *((threadgroup float2*)(so + m * DV + dv_base + d));
       }
 
-      for (int i = tid; i < BLOCK_N * MMA_DV; i += total_threads) {
-        const int token_local = i / MMA_DV;
-        const int d = i % MMA_DV;
+      for (int i2 = tid; i2 < BLOCK_N * MMA_DV_VEC; i2 += total_threads) {
+        const int token_local = i2 / MMA_DV_VEC;
+        const int d2 = i2 % MMA_DV_VEC;
+        const int d = d2 * VEC_WIDTH;
         if (token_local < valid_n) {
           int page_idx = kv_indices[kv_start + kv_block_start + token_local];
-          st[i] = V_cache[page_idx * kv_cache_stride_v + cur_kv_head * DV +
-                          dv_base + d];
+          copy_vec2(
+              st, token_local * MMA_DV + d,
+              V_cache,
+              page_idx * kv_cache_stride_v + cur_kv_head * DV + dv_base + d);
         } else {
-          st[i] = T(0);
+          *((threadgroup vec2_t<T>*)(st + token_local * MMA_DV + d)) =
+              vec2_t<T>(T(0), T(0));
         }
       }
 
@@ -278,10 +318,12 @@ template <
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
-      for (int i = tid; i < BLOCK_M * MMA_DV; i += total_threads) {
-        const int m = i / MMA_DV;
-        const int d = i % MMA_DV;
-        so[m * DV + dv_base + d] = so_tile[i];
+      for (int i2 = tid; i2 < BLOCK_M * MMA_DV_VEC; i2 += total_threads) {
+        const int m = i2 / MMA_DV_VEC;
+        const int d2 = i2 % MMA_DV_VEC;
+        const int d = d2 * VEC_WIDTH;
+        *((threadgroup float2*)(so + m * DV + dv_base + d)) =
+            *((threadgroup float2*)(so_tile + m * MMA_DV + d));
       }
 
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -297,9 +339,12 @@ template <
     float esum = s_esum[m];
     float inv_sum = (esum > 0.0f) ? (1.0f / esum) : 0.0f;
 
-    for (int d = tid; d < DV; d += total_threads) {
-      O[global_token * o_stride_token + cur_head * o_stride_head + d] =
-          static_cast<T>(so[m * DV + d] * inv_sum);
+    for (int d2 = tid; d2 < DV_VEC; d2 += total_threads) {
+      const int d = d2 * VEC_WIDTH;
+      float2 out_f = *((threadgroup float2*)(so + m * DV + d)) * inv_sum;
+      *((device vec2_t<T>*)(O + global_token * o_stride_token +
+                            cur_head * o_stride_head + d)) =
+          vec2_t<T>(static_cast<T>(out_f[0]), static_cast<T>(out_f[1]));
     }
   }
 }
@@ -311,7 +356,7 @@ template <
 
 #define instantiate_prefill(type_name, type, dk, dv) \
   instantiate_kernel("paged_prefill_attention_" #type_name "_dk" #dk "_dv" #dv, \
-    paged_prefill_attention, type, dk, dv, 8, 32, 4)
+    paged_prefill_attention, type, dk, dv, 16, 32, 4)
 
 // float16
 instantiate_prefill(float16, half, 128, 128)
