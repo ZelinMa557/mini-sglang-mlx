@@ -1,26 +1,40 @@
 #include <metal_stdlib>
-#include <metal_simdgroup_matrix>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include "mlx/backend/metal/kernels/utils.h"
 using namespace metal;
+
+template <typename T>
+using vec2_t = vec<T, 2>;
+
+template <typename T>
+METAL_FUNC inline void copy_vec2(
+    threadgroup T* dst,
+    int dst_idx,
+    const device T* src,
+    int src_idx) {
+  *((threadgroup vec2_t<T>*)(dst + dst_idx)) =
+      *((const device vec2_t<T>*)(src + src_idx));
+}
 
 // ============================================================================
 // Stage 1: Grouped Paged Decode Attention
 //
-// Grid: (batch, ceil(num_q_heads / BLOCK_H), max_kv_splits)
+// Grid: (batch, num_kv_heads, max_kv_splits)
 //
-// Shared memory Q/K/V tiles use native type T (half or bfloat16_t).
-// simdgroup_matrix<T, 8, 8> is used for matmul -- works for both types.
-// P (softmax probabilities) is stored as half since it's in [0,1].
-// Accumulator (so) and softmax state are float32.
+// Q stays resident in threadgroup memory across KV blocks. K/V are streamed as
+// 32x32 sub-tiles and consumed immediately by Apple GPU tensor ops. We also
+// cache the 32 page indices of the current KV block in threadgroup memory so
+// both QK and PV reuse the same gathered indirection.
 // ============================================================================
 
 template <
     typename T,
-    short DK,        // head key dimension
-    short DV,        // head value dimension
-    short BLOCK_H,   // query heads per threadgroup (8)
-    short BLOCK_N,   // KV tokens per inner loop iteration (32)
-    short NSG>       // number of SIMD groups (4)
+    short DK,
+    short DV,
+    short BLOCK_H,
+    short BLOCK_N,
+    short NSG>
 [[kernel]] void paged_decode_attention_stage1(
     const device T* Q                 [[buffer(0)]],
     const device T* K_cache           [[buffer(1)]],
@@ -39,71 +53,98 @@ template <
     ushort tiisg  [[thread_index_in_simdgroup]],
     ushort sgitg  [[simdgroup_index_in_threadgroup]]) {
 
-  // Type alias for simdgroup matrix matching T
-  using T8x8 = simdgroup_matrix<T, 8, 8>;
+  static_assert(BLOCK_N == 32, "paged_decode_attention expects BLOCK_N == 32");
+  static_assert(NSG == 4, "paged_decode_attention expects NSG == 4");
+  static_assert(BLOCK_H == 8 || BLOCK_H == 16,
+                "paged_decode_attention expects BLOCK_H in {8, 16}");
+
+  constexpr int MMA_K = 32;
+  constexpr int MMA_DV = 32;
+  constexpr int VEC_WIDTH = 2;
+  constexpr int DK_VEC = DK / VEC_WIDTH;
+  constexpr int DV_VEC = DV / VEC_WIDTH;
+  constexpr int MMA_K_VEC = MMA_K / VEC_WIDTH;
+  constexpr int MMA_DV_VEC = MMA_DV / VEC_WIDTH;
+
+  using Ext2D = dextents<int32_t, 2>;
+  using QKMatmul = mpp::tensor_ops::matmul2d<
+      mpp::tensor_ops::matmul2d_descriptor(
+          BLOCK_H, BLOCK_N, MMA_K, false, true, false,
+          mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+      execution_simdgroups<NSG>>;
+  using PVMatmul = mpp::tensor_ops::matmul2d<
+      mpp::tensor_ops::matmul2d_descriptor(
+          BLOCK_H, MMA_DV, BLOCK_N, false, false, false,
+          mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+      execution_simdgroups<NSG>>;
 
   const int cur_batch = tgpig.x;
-  const int cur_head_group = tgpig.y;
+  const int cur_kv_head = tgpig.y;
   const int split_kv_id = tgpig.z;
 
   const int kv_group_num = num_q_heads / num_kv_heads;
-  const int valid_block_h = min((int)BLOCK_H, kv_group_num);
+  if ((BLOCK_H == 8 && kv_group_num > 8) || (BLOCK_H == 16 && kv_group_num <= 8)) {
+    return;
+  }
 
-  const int cur_q_head_start = cur_head_group * valid_block_h;
-  const int cur_kv_head = cur_q_head_start / kv_group_num;
+  const int actual_heads = kv_group_num;
+  const int cur_q_head_start = cur_kv_head * kv_group_num;
 
-  if (cur_q_head_start >= num_q_heads) return;
-
-  const int actual_heads = min(valid_block_h, num_q_heads - cur_q_head_start);
-
-  // ---- KV sequence range for this split ----
   const int kv_start = kv_indptr[cur_batch];
   const int cur_batch_seq_len = kv_indptr[cur_batch + 1] - kv_start;
   if (cur_batch_seq_len <= 0) return;
 
   const int kv_splits = num_kv_splits_buf[cur_batch];
-
   constexpr int MIN_BLOCK_KV = 32;
-  const int kv_len_per_split = ((cur_batch_seq_len + kv_splits - 1) / kv_splits + MIN_BLOCK_KV - 1) / MIN_BLOCK_KV * MIN_BLOCK_KV;
+  const int kv_len_per_split =
+      ((cur_batch_seq_len + kv_splits - 1) / kv_splits + MIN_BLOCK_KV - 1) /
+      MIN_BLOCK_KV * MIN_BLOCK_KV;
   const int split_kv_start = kv_len_per_split * split_kv_id;
   const int split_kv_end = min(split_kv_start + kv_len_per_split, cur_batch_seq_len);
-
   if (split_kv_start >= split_kv_end) return;
 
   // ---- Shared memory layout ----
-  // sq:  BLOCK_H * DK elements of T
-  // sk:  BLOCK_N * DK elements of T
-  // sv:  BLOCK_N * DV elements of T
-  // sp:  BLOCK_H * BLOCK_N elements of half (P matrix for S@V)
-  // ss:  BLOCK_H * BLOCK_N floats (QK^T scores)
-  // so:  BLOCK_H * DV floats (output accumulator)
-  // s_emax: BLOCK_H floats
-  // s_esum: BLOCK_H floats
+  // sq:      BLOCK_H * DK elements of T
+  // sqk:     BLOCK_H * MMA_K elements of T
+  // st:      BLOCK_N * max(MMA_K, MMA_DV) elements of T
+  // s_idx:   BLOCK_N page indices
+  // ss:      BLOCK_H * BLOCK_N floats
+  // so_tile: BLOCK_H * MMA_DV floats
+  // so:      BLOCK_H * DV floats
+  // s_emax:  BLOCK_H floats
+  // s_esum:  BLOCK_H floats
+  // sp:      BLOCK_H * BLOCK_N half
   threadgroup T* sq = (threadgroup T*)shmem_raw;
-  threadgroup T* sk = sq + BLOCK_H * DK;
-  threadgroup T* sv = sk;
-  threadgroup half* sp = (threadgroup half*)(sv + BLOCK_N * DV);
-  threadgroup float* ss = (threadgroup float*)(sp + BLOCK_H * BLOCK_N);
-  threadgroup float* so = ss + BLOCK_H * BLOCK_N;
+  threadgroup T* sqk = sq + BLOCK_H * DK;
+  threadgroup T* st = sqk + BLOCK_H * MMA_K;
+  threadgroup int32_t* s_idx = (threadgroup int32_t*)(st + BLOCK_N * MMA_K);
+  threadgroup float* ss = (threadgroup float*)(s_idx + BLOCK_N);
+  threadgroup float* so_tile = ss + BLOCK_H * BLOCK_N;
+  threadgroup float* so = so_tile + BLOCK_H * MMA_DV;
   threadgroup float* s_emax = so + BLOCK_H * DV;
   threadgroup float* s_esum = s_emax + BLOCK_H;
+  threadgroup half* sp = (threadgroup half*)(s_esum + BLOCK_H);
 
   constexpr int NW = 32;
   const int tid = sgitg * NW + tiisg;
   const int total_threads = NSG * NW;
 
-  // ---- Load Q into shared memory ----
   const int q_stride_batch = num_q_heads * DK;
   for (int h = 0; h < BLOCK_H; h++) {
     int global_head = cur_q_head_start + h;
-    for (int d = tid; d < DK; d += total_threads) {
-      sq[h * DK + d] = (h < actual_heads)
-          ? Q[cur_batch * q_stride_batch + global_head * DK + d]
-          : T(0);
+    for (int d2 = tid; d2 < DK_VEC; d2 += total_threads) {
+      const int d = d2 * VEC_WIDTH;
+      if (h < actual_heads) {
+        copy_vec2(
+            sq, h * DK + d,
+            Q,
+            cur_batch * q_stride_batch + global_head * DK + d);
+      } else {
+        *((threadgroup vec2_t<T>*)(sq + h * DK + d)) = vec2_t<T>(T(0), T(0));
+      }
     }
   }
 
-  // Initialize accumulators
   for (int i = tid; i < BLOCK_H * DV; i += total_threads) {
     so[i] = 0.0f;
   }
@@ -114,69 +155,84 @@ template <
 
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  const int kv_cache_stride = num_kv_heads * DK;
+  const int kv_cache_stride_k = num_kv_heads * DK;
   const int kv_cache_stride_v = num_kv_heads * DV;
 
-  // ---- Main loop over KV blocks ----
+  QKMatmul qk_mma;
+  PVMatmul pv_mma;
+
+  auto qk_scores = tensor<threadgroup float, Ext2D, tensor_inline>(
+      ss, Ext2D(BLOCK_N, BLOCK_H));
+  auto p_tile = tensor<threadgroup half, Ext2D, tensor_inline>(
+      sp, Ext2D(BLOCK_N, BLOCK_H));
+
   for (int block_start = split_kv_start; block_start < split_kv_end; block_start += BLOCK_N) {
     const int block_end = min(block_start + BLOCK_N, split_kv_end);
     const int valid_n = block_end - block_start;
 
-    // ---- Load K block ----
-    for (int n = tid; n < BLOCK_N * DK; n += total_threads) {
-      const int token_local = n / DK;
-      const int d = n % DK;
-      if (token_local < valid_n) {
-        int page_idx = kv_indices[kv_start + block_start + token_local];
-        sk[token_local * DK + d] = K_cache[page_idx * kv_cache_stride + cur_kv_head * DK + d];
+    for (int i = tid; i < BLOCK_H * BLOCK_N; i += total_threads) {
+      ss[i] = 0.0f;
+    }
+
+    for (int n = tid; n < BLOCK_N; n += total_threads) {
+      if (n < valid_n) {
+        s_idx[n] = kv_indices[kv_start + block_start + n];
       } else {
-        sk[token_local * DK + d] = T(0);
+        s_idx[n] = -1;
       }
     }
-
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- QK^T using simdgroup_matrix<T> ----
-
-    {
-      constexpr int N_TILES = BLOCK_N / 8;
-      constexpr int TILES_PER_SG = (N_TILES + NSG - 1) / NSG;
-
-      for (int tile_idx = 0; tile_idx < TILES_PER_SG; tile_idx++) {
-        int n_tile = sgitg * TILES_PER_SG + tile_idx;
-        if (n_tile >= N_TILES) break;
-
-        simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
-
-        constexpr int DK8 = DK / 8;
-        for (int dk = 0; dk < DK8; dk++) {
-          T8x8 mq;
-          T8x8 mk;
-          simdgroup_load(mq, sq + dk * 8, DK);
-          simdgroup_load(mk, sk + dk * 8 + n_tile * 8 * DK, DK, 0, true);
-          simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+    for (int dk_base = 0; dk_base < DK; dk_base += MMA_K) {
+      for (int i2 = tid; i2 < BLOCK_H * MMA_K_VEC; i2 += total_threads) {
+        const int h = i2 / MMA_K_VEC;
+        const int k2 = i2 % MMA_K_VEC;
+        const int k = k2 * VEC_WIDTH;
+        if (h < actual_heads) {
+          *((threadgroup vec2_t<T>*)(sqk + h * MMA_K + k)) =
+              *((threadgroup vec2_t<T>*)(sq + h * DK + dk_base + k));
+        } else {
+          *((threadgroup vec2_t<T>*)(sqk + h * MMA_K + k)) =
+              vec2_t<T>(T(0), T(0));
         }
-
-        simdgroup_store(mqk, ss + n_tile * 8, BLOCK_N, 0, false);
       }
+
+      for (int i2 = tid; i2 < BLOCK_N * MMA_K_VEC; i2 += total_threads) {
+        const int token_local = i2 / MMA_K_VEC;
+        const int k2 = i2 % MMA_K_VEC;
+        const int k = k2 * VEC_WIDTH;
+        if (token_local < valid_n) {
+          int page_idx = s_idx[token_local];
+          copy_vec2(
+              st, token_local * MMA_K + k,
+              K_cache,
+              page_idx * kv_cache_stride_k + cur_kv_head * DK + dk_base + k);
+        } else {
+          *((threadgroup vec2_t<T>*)(st + token_local * MMA_K + k)) =
+              vec2_t<T>(T(0), T(0));
+        }
+      }
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      auto q_tile = tensor<threadgroup T, Ext2D, tensor_inline>(
+          sqk, Ext2D(MMA_K, BLOCK_H));
+      auto k_tile = tensor<threadgroup T, Ext2D, tensor_inline>(
+          st, Ext2D(MMA_K, BLOCK_N));
+      qk_mma.run(q_tile, k_tile, qk_scores);
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // ---- Scale + validity mask ----
     for (int i = tid; i < BLOCK_H * BLOCK_N; i += total_threads) {
       int h = i / BLOCK_N;
       int n = i % BLOCK_N;
-
       float val = ss[h * BLOCK_N + n] * sm_scale;
-      bool is_valid = (n < valid_n) && (h < actual_heads);
-
+      bool is_valid = (h < actual_heads) && (n < valid_n);
       ss[h * BLOCK_N + n] = is_valid ? val : -HUGE_VALF;
     }
-
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- Online softmax ----
     for (int h = sgitg; h < BLOCK_H; h += NSG) {
       float row_max = -HUGE_VALF;
       for (int n = tiisg; n < BLOCK_N; n += NW) {
@@ -205,78 +261,83 @@ template <
         s_emax[h] = new_max;
       }
     }
-
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- Load V block ----
-    for (int n = tid; n < BLOCK_N * DV; n += total_threads) {
-      const int token_local = n / DV;
-      const int d = n % DV;
-      if (token_local < valid_n) {
-        int page_idx = kv_indices[kv_start + block_start + token_local];
-        sv[token_local * DV + d] = V_cache[page_idx * kv_cache_stride_v + cur_kv_head * DV + d];
-      } else {
-        sv[token_local * DV + d] = T(0);
-      }
-    }
-
-    // Convert P (float ss) -> half sp for matmul
-    // P values are in [0,1], half precision is sufficient
     for (int i = tid; i < BLOCK_H * BLOCK_N; i += total_threads) {
       sp[i] = static_cast<half>(ss[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- P @ V using simdgroup matmul ----
-    // P is half, V is T. We use half8x8 for P and T8x8 for V.
-    // simdgroup_multiply_accumulate(float8x8, half8x8, T8x8, float8x8) works
-    // because the accumulator is float32.
-    {
-      constexpr int DV_TILES = DV / 8;
-      constexpr int TILES_PER_SG = (DV_TILES + NSG - 1) / NSG;
-
-      for (int tile_idx = 0; tile_idx < TILES_PER_SG; tile_idx++) {
-        int dv_tile = sgitg * TILES_PER_SG + tile_idx;
-        if (dv_tile >= DV_TILES) break;
-
-        simdgroup_float8x8 mo;
-        simdgroup_load(mo, so + dv_tile * 8, DV);
-
-        constexpr int BN8 = BLOCK_N / 8;
-        for (int bn = 0; bn < BN8; bn++) {
-          simdgroup_half8x8 mp;
-          T8x8 mv;
-          simdgroup_load(mp, sp + bn * 8, BLOCK_N);
-          simdgroup_load(mv, sv + bn * 8 * DV + dv_tile * 8, DV);
-          simdgroup_multiply_accumulate(mo, mp, mv, mo);
-        }
-
-        simdgroup_store(mo, so + dv_tile * 8, DV);
+    for (int dv_base = 0; dv_base < DV; dv_base += MMA_DV) {
+      for (int i2 = tid; i2 < BLOCK_H * MMA_DV_VEC; i2 += total_threads) {
+        const int h = i2 / MMA_DV_VEC;
+        const int d2 = i2 % MMA_DV_VEC;
+        const int d = d2 * VEC_WIDTH;
+        *((threadgroup float2*)(so_tile + h * MMA_DV + d)) =
+            *((threadgroup float2*)(so + h * DV + dv_base + d));
       }
-    }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int i2 = tid; i2 < BLOCK_N * MMA_DV_VEC; i2 += total_threads) {
+        const int token_local = i2 / MMA_DV_VEC;
+        const int d2 = i2 % MMA_DV_VEC;
+        const int d = d2 * VEC_WIDTH;
+        if (token_local < valid_n) {
+          int page_idx = s_idx[token_local];
+          copy_vec2(
+              st, token_local * MMA_DV + d,
+              V_cache,
+              page_idx * kv_cache_stride_v + cur_kv_head * DV + dv_base + d);
+        } else {
+          *((threadgroup vec2_t<T>*)(st + token_local * MMA_DV + d)) =
+              vec2_t<T>(T(0), T(0));
+        }
+      }
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      auto v_tile = tensor<threadgroup T, Ext2D, tensor_inline>(
+          st, Ext2D(MMA_DV, BLOCK_N));
+      auto o_tile = tensor<threadgroup float, Ext2D, tensor_inline>(
+          so_tile, Ext2D(MMA_DV, BLOCK_H));
+      pv_mma.run(p_tile, v_tile, o_tile);
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      for (int i2 = tid; i2 < BLOCK_H * MMA_DV_VEC; i2 += total_threads) {
+        const int h = i2 / MMA_DV_VEC;
+        const int d2 = i2 % MMA_DV_VEC;
+        const int d = d2 * VEC_WIDTH;
+        *((threadgroup float2*)(so + h * DV + dv_base + d)) =
+            *((threadgroup float2*)(so_tile + h * MMA_DV + d));
+      }
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
   }
 
-
-  // ---- Store partial results ----
   const int out_stride_batch = num_q_heads * max_kv_splits * DV;
   const int out_stride_head = max_kv_splits * DV;
   const int lse_stride_batch = num_q_heads * max_kv_splits;
   const int lse_stride_head = max_kv_splits;
+  const int out_head_base = cur_q_head_start * out_stride_head;
+  const int lse_head_base = cur_q_head_start * lse_stride_head;
 
   for (int h = 0; h < actual_heads; h++) {
     int global_head = cur_q_head_start + h;
     float esum = s_esum[h];
     float inv_sum = (esum > 0.0f) ? (1.0f / esum) : 0.0f;
 
-    int out_offset = cur_batch * out_stride_batch + global_head * out_stride_head + split_kv_id * DV;
-    for (int d = tid; d < DV; d += total_threads) {
-      Att_Out[out_offset + d] = so[h * DV + d] * inv_sum;
+    int out_offset = cur_batch * out_stride_batch + out_head_base +
+                     h * out_stride_head + split_kv_id * DV;
+    for (int d2 = tid; d2 < DV_VEC; d2 += total_threads) {
+      const int d = d2 * VEC_WIDTH;
+      float2 out_f = *((threadgroup float2*)(so + h * DV + d)) * inv_sum;
+      *((device float2*)(Att_Out + out_offset + d)) = out_f;
     }
 
     if (tid == 0) {
-      int lse_offset = cur_batch * lse_stride_batch + global_head * lse_stride_head + split_kv_id;
+      int lse_offset = cur_batch * lse_stride_batch + lse_head_base +
+                       h * lse_stride_head + split_kv_id;
       Att_Lse[lse_offset] = s_emax[h] + log(esum);
     }
   }
@@ -300,6 +361,8 @@ template <typename T, short DV>
     ushort tiisg  [[thread_index_in_simdgroup]],
     ushort sgitg  [[simdgroup_index_in_threadgroup]]) {
 
+  (void)sgitg;
+
   const int cur_batch = tgpig.x;
   const int cur_head = tgpig.y;
 
@@ -307,9 +370,10 @@ template <typename T, short DV>
   if (cur_batch_seq_len <= 0) return;
 
   const int kv_splits = num_kv_splits_buf[cur_batch];
-
   constexpr int MIN_BLOCK_KV = 32;
-  const int kv_len_per_split = ((cur_batch_seq_len + kv_splits - 1) / kv_splits + MIN_BLOCK_KV - 1) / MIN_BLOCK_KV * MIN_BLOCK_KV;
+  const int kv_len_per_split =
+      ((cur_batch_seq_len + kv_splits - 1) / kv_splits + MIN_BLOCK_KV - 1) /
+      MIN_BLOCK_KV * MIN_BLOCK_KV;
 
   const int out_stride_batch = num_q_heads * max_kv_splits * DV;
   const int out_stride_head = max_kv_splits * DV;
@@ -317,7 +381,6 @@ template <typename T, short DV>
   const int lse_stride_head = max_kv_splits;
 
   constexpr int NW = 32;
-
   float e_max = -HUGE_VALF;
   float e_sum = 0.0f;
 
@@ -353,7 +416,6 @@ template <typename T, short DV>
 
   int o_offset = cur_batch * num_q_heads * DV + cur_head * DV;
   float inv_sum = (e_sum > 0.0f) ? (1.0f / e_sum) : 0.0f;
-
   for (int i = 0; i < ELEMS_PER_THREAD; i++) {
     int d = tiisg + i * NW;
     if (d < DV) {
@@ -367,23 +429,25 @@ template <typename T, short DV>
 // Template Instantiations
 // ============================================================================
 
-#define instantiate_stage1(type_name, type, dk, dv) \
-  instantiate_kernel("paged_decode_attention_stage1_" #type_name "_dk" #dk "_dv" #dv, \
-    paged_decode_attention_stage1, type, dk, dv, 8, 32, 4)
+#define instantiate_stage1(type_name, type, dk, dv, block_h) \
+  instantiate_kernel("paged_decode_attention_stage1_" #type_name "_dk" #dk "_dv" #dv "_bh" #block_h, \
+    paged_decode_attention_stage1, type, dk, dv, block_h, 32, 4)
 
 #define instantiate_stage2(type_name, type, dv) \
   instantiate_kernel("paged_decode_attention_stage2_" #type_name "_dv" #dv, \
     paged_decode_attention_stage2, type, dv)
 
-// float16
-instantiate_stage1(float16, half, 128, 128)
-instantiate_stage1(float16, half, 256, 256)
+instantiate_stage1(float16, half, 128, 128, 8)
+instantiate_stage1(float16, half, 128, 128, 16)
+instantiate_stage1(float16, half, 256, 256, 8)
+instantiate_stage1(float16, half, 256, 256, 16)
 
 instantiate_stage2(float16, half, 128)
 instantiate_stage2(float16, half, 256)
 
-// bfloat16
-instantiate_stage1(bfloat16, bfloat16_t, 128, 128)
-instantiate_stage1(bfloat16, bfloat16_t, 256, 256)
+instantiate_stage1(bfloat16, bfloat16_t, 128, 128, 8)
+instantiate_stage1(bfloat16, bfloat16_t, 128, 128, 16)
+instantiate_stage1(bfloat16, bfloat16_t, 256, 256, 8)
+instantiate_stage1(bfloat16, bfloat16_t, 256, 256, 16)
 instantiate_stage2(bfloat16, bfloat16_t, 128)
 instantiate_stage2(bfloat16, bfloat16_t, 256)
