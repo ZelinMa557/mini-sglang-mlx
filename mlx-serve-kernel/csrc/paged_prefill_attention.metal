@@ -1,5 +1,6 @@
 #include <metal_stdlib>
-#include <metal_simdgroup_matrix>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include "mlx/backend/metal/kernels/utils.h"
 using namespace metal;
 
@@ -8,10 +9,13 @@ using namespace metal;
 //
 // Grid: (batch, num_q_heads, ceil(max_q_len / BLOCK_M))
 //
-// Shared memory Q/K/V tiles use native type T (half or bfloat16_t).
-// simdgroup_matrix<T, 8, 8> is used for matmul -- works for both types.
+// Q stays resident in threadgroup memory because it is reused across all KV
+// blocks. K/V are streamed as 32x32 sub-tiles and consumed immediately by
+// Apple GPU tensor ops (`mpp::tensor_ops::matmul2d`) so we no longer allocate
+// a full K/V block in threadgroup memory.
+//
 // P (softmax probabilities) is stored as half since it's in [0,1].
-// Accumulator (so) and softmax state are float32.
+// Accumulators and softmax state are float32.
 // ============================================================================
 
 template <
@@ -38,7 +42,24 @@ template <
     ushort tiisg  [[thread_index_in_simdgroup]],
     ushort sgitg  [[simdgroup_index_in_threadgroup]]) {
 
-  using T8x8 = simdgroup_matrix<T, 8, 8>;
+  static_assert(BLOCK_M == 8, "paged_prefill_attention expects BLOCK_M == 8");
+  static_assert(BLOCK_N == 32, "paged_prefill_attention expects BLOCK_N == 32");
+  static_assert(NSG == 4, "paged_prefill_attention expects NSG == 4");
+
+  constexpr int MMA_K = 32;
+  constexpr int MMA_DV = 32;
+
+  using Ext2D = dextents<int32_t, 2>;
+  using QKMatmul = mpp::tensor_ops::matmul2d<
+      mpp::tensor_ops::matmul2d_descriptor(
+          BLOCK_M, BLOCK_N, MMA_K, false, true, false,
+          mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+      execution_simdgroups<NSG>>;
+  using PVMatmul = mpp::tensor_ops::matmul2d<
+      mpp::tensor_ops::matmul2d_descriptor(
+          BLOCK_M, MMA_DV, BLOCK_N, false, false, false,
+          mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+      execution_simdgroups<NSG>>;
 
   const int cur_seq = tgpig.x;
   const int cur_head = tgpig.y;
@@ -61,22 +82,24 @@ template <
   const int valid_m = min((int)BLOCK_M, cur_seq_q_len - q_block_start);
 
   // ---- Shared memory layout ----
-  // sq:  BLOCK_M * DK elements of T
-  // sk:  BLOCK_N * DK elements of T
-  // sv:  BLOCK_N * DV elements of T
-  // sp:  BLOCK_M * BLOCK_N elements of half (P matrix)
-  // ss:  BLOCK_M * BLOCK_N floats (QK^T scores)
-  // so:  BLOCK_M * DV floats (output accumulator)
+  // sq:     BLOCK_M * DK elements of T
+  // sqk:    BLOCK_M * MMA_K elements of T     (streamed Q sub-tile)
+  // st:     BLOCK_N * max(MMA_K, MMA_DV) of T (streamed K/V sub-tile)
+  // ss:     BLOCK_M * BLOCK_N floats          (QK^T scores)
+  // so_tile:BLOCK_M * MMA_DV floats           (contiguous output sub-tile)
+  // so:     BLOCK_M * DV floats               (full output accumulator)
   // s_emax: BLOCK_M floats
   // s_esum: BLOCK_M floats
+  // sp:     BLOCK_M * BLOCK_N half            (P matrix)
   threadgroup T* sq = (threadgroup T*)shmem_raw;
-  threadgroup T* sk = sq + BLOCK_M * DK;
-  threadgroup T* sv = sk;
-  threadgroup half* sp = (threadgroup half*)(sv + BLOCK_N * DV);
-  threadgroup float* ss = (threadgroup float*)(sp + BLOCK_M * BLOCK_N);
-  threadgroup float* so = ss + BLOCK_M * BLOCK_N;
+  threadgroup T* sqk = sq + BLOCK_M * DK;
+  threadgroup T* st = sqk + BLOCK_M * MMA_K;
+  threadgroup float* ss = (threadgroup float*)(st + BLOCK_N * MMA_K);
+  threadgroup float* so_tile = ss + BLOCK_M * BLOCK_N;
+  threadgroup float* so = so_tile + BLOCK_M * MMA_DV;
   threadgroup float* s_emax = so + BLOCK_M * DV;
   threadgroup float* s_esum = s_emax + BLOCK_M;
+  threadgroup half* sp = (threadgroup half*)(s_esum + BLOCK_M);
 
   constexpr int NW = 32;
   const int tid = sgitg * NW + tiisg;
@@ -111,50 +134,54 @@ template <
   const int kv_cache_stride_k = num_kv_heads * DK;
   const int kv_cache_stride_v = num_kv_heads * DV;
 
+  QKMatmul qk_mma;
+  PVMatmul pv_mma;
+
+  auto qk_scores = tensor<threadgroup float, Ext2D, tensor_inline>(
+      ss, Ext2D(BLOCK_N, BLOCK_M));
+  auto p_tile = tensor<threadgroup half, Ext2D, tensor_inline>(
+      sp, Ext2D(BLOCK_N, BLOCK_M));
+
   // ---- Main loop over KV blocks ----
   for (int kv_block_start = 0; kv_block_start < cur_seq_kv_len; kv_block_start += BLOCK_N) {
     const int kv_block_end = min(kv_block_start + BLOCK_N, cur_seq_kv_len);
     const int valid_n = kv_block_end - kv_block_start;
 
-    // ---- Load K block ----
-    for (int n = tid; n < BLOCK_N * DK; n += total_threads) {
-      const int token_local = n / DK;
-      const int d = n % DK;
-      if (token_local < valid_n) {
-        int page_idx = kv_indices[kv_start + kv_block_start + token_local];
-        sk[token_local * DK + d] = K_cache[page_idx * kv_cache_stride_k + cur_kv_head * DK + d];
-      } else {
-        sk[token_local * DK + d] = T(0);
-      }
+    for (int i = tid; i < BLOCK_M * BLOCK_N; i += total_threads) {
+      ss[i] = 0.0f;
     }
-
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- QK^T ----
-    {
-      constexpr int N_TILES = BLOCK_N / 8;
-      constexpr int TILES_PER_SG = (N_TILES + NSG - 1) / NSG;
+    // ---- QK^T via tensor ops with streamed 8x32 / 32x32 sub-tiles ----
+    for (int dk_base = 0; dk_base < DK; dk_base += MMA_K) {
+      for (int i = tid; i < BLOCK_M * MMA_K; i += total_threads) {
+        const int m = i / MMA_K;
+        const int k = i % MMA_K;
+        sqk[i] = (m < valid_m) ? sq[m * DK + dk_base + k] : T(0);
+      }
 
-      for (int tile_idx = 0; tile_idx < TILES_PER_SG; tile_idx++) {
-        int n_tile = sgitg * TILES_PER_SG + tile_idx;
-        if (n_tile >= N_TILES) break;
-
-        simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
-
-        constexpr int DK8 = DK / 8;
-        for (int dk = 0; dk < DK8; dk++) {
-          T8x8 mq;
-          T8x8 mk;
-          simdgroup_load(mq, sq + dk * 8, DK);
-          simdgroup_load(mk, sk + dk * 8 + n_tile * 8 * DK, DK, 0, true);
-          simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+      for (int i = tid; i < BLOCK_N * MMA_K; i += total_threads) {
+        const int token_local = i / MMA_K;
+        const int k = i % MMA_K;
+        if (token_local < valid_n) {
+          int page_idx = kv_indices[kv_start + kv_block_start + token_local];
+          st[i] = K_cache[page_idx * kv_cache_stride_k + cur_kv_head * DK +
+                          dk_base + k];
+        } else {
+          st[i] = T(0);
         }
-
-        simdgroup_store(mqk, ss + n_tile * 8, BLOCK_N, 0, false);
       }
-    }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      auto q_tile = tensor<threadgroup T, Ext2D, tensor_inline>(
+          sqk, Ext2D(MMA_K, BLOCK_M));
+      auto k_tile = tensor<threadgroup T, Ext2D, tensor_inline>(
+          st, Ext2D(MMA_K, BLOCK_N));
+      qk_mma.run(q_tile, k_tile, qk_scores);
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     // ---- Scale + causal mask ----
     for (int i = tid; i < BLOCK_M * BLOCK_N; i += total_threads) {
@@ -215,50 +242,50 @@ template <
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- Load V block ----
-    for (int n = tid; n < BLOCK_N * DV; n += total_threads) {
-      const int token_local = n / DV;
-      const int d = n % DV;
-      if (token_local < valid_n) {
-        int page_idx = kv_indices[kv_start + kv_block_start + token_local];
-        sv[token_local * DV + d] = V_cache[page_idx * kv_cache_stride_v + cur_kv_head * DV + d];
-      } else {
-        sv[token_local * DV + d] = T(0);
-      }
-    }
-
     // Convert P (float ss) -> half sp
     for (int i = tid; i < BLOCK_M * BLOCK_N; i += total_threads) {
       sp[i] = static_cast<half>(ss[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- P @ V ----
-    {
-      constexpr int DV_TILES = DV / 8;
-      constexpr int TILES_PER_SG = (DV_TILES + NSG - 1) / NSG;
-
-      for (int tile_idx = 0; tile_idx < TILES_PER_SG; tile_idx++) {
-        int dv_tile = sgitg * TILES_PER_SG + tile_idx;
-        if (dv_tile >= DV_TILES) break;
-
-        simdgroup_float8x8 mo;
-        simdgroup_load(mo, so + dv_tile * 8, DV);
-
-        constexpr int BN8 = BLOCK_N / 8;
-        for (int bn = 0; bn < BN8; bn++) {
-          simdgroup_half8x8 mp;
-          T8x8 mv;
-          simdgroup_load(mp, sp + bn * 8, BLOCK_N);
-          simdgroup_load(mv, sv + bn * 8 * DV + dv_tile * 8, DV);
-          simdgroup_multiply_accumulate(mo, mp, mv, mo);
-        }
-
-        simdgroup_store(mo, so + dv_tile * 8, DV);
+    // ---- P @ V via tensor ops with streamed 32x32 V sub-tiles ----
+    for (int dv_base = 0; dv_base < DV; dv_base += MMA_DV) {
+      for (int i = tid; i < BLOCK_M * MMA_DV; i += total_threads) {
+        const int m = i / MMA_DV;
+        const int d = i % MMA_DV;
+        so_tile[i] = so[m * DV + dv_base + d];
       }
-    }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int i = tid; i < BLOCK_N * MMA_DV; i += total_threads) {
+        const int token_local = i / MMA_DV;
+        const int d = i % MMA_DV;
+        if (token_local < valid_n) {
+          int page_idx = kv_indices[kv_start + kv_block_start + token_local];
+          st[i] = V_cache[page_idx * kv_cache_stride_v + cur_kv_head * DV +
+                          dv_base + d];
+        } else {
+          st[i] = T(0);
+        }
+      }
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      auto v_tile = tensor<threadgroup T, Ext2D, tensor_inline>(
+          st, Ext2D(MMA_DV, BLOCK_N));
+      auto o_tile = tensor<threadgroup float, Ext2D, tensor_inline>(
+          so_tile, Ext2D(MMA_DV, BLOCK_M));
+      pv_mma.run(p_tile, v_tile, o_tile);
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      for (int i = tid; i < BLOCK_M * MMA_DV; i += total_threads) {
+        const int m = i / MMA_DV;
+        const int d = i % MMA_DV;
+        so[m * DV + dv_base + d] = so_tile[i];
+      }
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
   }
 
   // ---- Write output ----
