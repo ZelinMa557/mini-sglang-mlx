@@ -130,6 +130,49 @@ def run_mlx_sdpa(data: dict) -> mx.array:
     return mx.stack(results, axis=0)  # (batch, N_q, D)
 
 
+def run_mlx_sdpa_uniform_batch(data: dict) -> mx.array:
+    """
+    Run MLX SDPA on a uniform-length batch in one call.
+
+    This path is only valid when every sequence in the batch has the same KV
+    length, because MLX SDPA does not support ragged K/V tensors directly.
+    Returns: (batch, N_q, D)
+    """
+    sm_scale = 1.0 / math.sqrt(data["head_dim"])
+    kv_indptr_np = np.array(data["kv_indptr"], dtype=np.int32)
+    kv_indices_np = np.array(data["kv_indices"], dtype=np.int32)
+
+    kv_lens = data["kv_lens"]
+    if len(set(kv_lens)) != 1:
+        raise ValueError("run_mlx_sdpa_uniform_batch requires equal KV lengths")
+
+    batch = data["batch"]
+    kv_len = kv_lens[0]
+
+    k_seqs = []
+    v_seqs = []
+    for b in range(batch):
+        kv_start = int(kv_indptr_np[b])
+        kv_end = int(kv_indptr_np[b + 1])
+        page_ids = mx.array(kv_indices_np[kv_start:kv_end].astype(np.int32))
+        k_seq = data["k_cache"][page_ids]  # (T_kv, N_kv, D)
+        v_seq = data["v_cache"][page_ids]
+        k_seqs.append(k_seq)
+        v_seqs.append(v_seq)
+
+    # [B, T_kv, N_kv, D] -> [B, N_kv, T_kv, D]
+    k_batch = mx.transpose(mx.stack(k_seqs, axis=0), (0, 2, 1, 3))
+    v_batch = mx.transpose(mx.stack(v_seqs, axis=0), (0, 2, 1, 3))
+
+    # q is already [B, N_q, D] -> [B, N_q, 1, D]
+    q_batch = mx.expand_dims(data["q"], axis=2)
+
+    out = mx.fast.scaled_dot_product_attention(
+        q_batch, k_batch, v_batch, scale=sm_scale
+    )  # [B, N_q, 1, D]
+    return out.squeeze(2)
+
+
 # ── Correctness ──────────────────────────────────────────────────────────────
 
 def test_correctness(
@@ -185,6 +228,37 @@ def bench(
     t0 = time.perf_counter()
     for _ in range(repeat):
         mx.eval(run_mlx_sdpa(data))
+    sdpa_ms = (time.perf_counter() - t0) / repeat * 1000
+
+    return ours_ms, sdpa_ms
+
+
+def bench_uniform_batch(
+    batch_size: int,
+    kv_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int = HEAD_DIM,
+    dtype=mx.bfloat16,
+    warmup: int = 20,
+    repeat: int = 100,
+):
+    data = build_paged_decode_inputs(
+        [kv_len] * batch_size, num_q_heads, num_kv_heads, head_dim, dtype
+    )
+
+    for _ in range(warmup):
+        mx.eval(run_our_kernel(data))
+    t0 = time.perf_counter()
+    for _ in range(repeat):
+        mx.eval(run_our_kernel(data))
+    ours_ms = (time.perf_counter() - t0) / repeat * 1000
+
+    for _ in range(warmup):
+        mx.eval(run_mlx_sdpa_uniform_batch(data))
+    t0 = time.perf_counter()
+    for _ in range(repeat):
+        mx.eval(run_mlx_sdpa_uniform_batch(data))
     sdpa_ms = (time.perf_counter() - t0) / repeat * 1000
 
     return ours_ms, sdpa_ms
@@ -248,3 +322,29 @@ if __name__ == "__main__":
             ours_ms, sdpa_ms = bench([kvl], nqh, nkvh, head_dim=head_dim)
             speedup = sdpa_ms / ours_ms if ours_ms > 0 else float("inf")
             print(f"  {head_dim:>6} {nkvh:>8} {nqh:>8} {kvl:>8} {ours_ms*1000:>10.1f} {sdpa_ms*1000:>10.1f} {speedup:>7.2f}x")
+
+    # ────── Uniform-batch performance tests ──────
+    print()
+    print("=" * 80)
+    print("Paged Decode Attention — Performance (Uniform Batch, us)")
+    print("=" * 80)
+    print(
+        f"  {'hdim':>6} {'kv_heads':>8} {'q_heads':>8} {'batch':>8} "
+        f"{'kv_len':>8} {'ours(us)':>10} {'sdpa(us)':>10} {'speedup':>8}"
+    )
+    print("  " + "-" * 88)
+
+    uniform_batch_sizes = [2, 4, 8]
+    uniform_kv_lens = [237, 1024, 4096, 8192]
+    for head_dim, nkvh, nqh in HEAD_CONFIGS:
+        for bs in uniform_batch_sizes:
+            for kvl in uniform_kv_lens:
+                ours_ms, sdpa_ms = bench_uniform_batch(
+                    bs, kvl, nqh, nkvh, head_dim=head_dim
+                )
+                speedup = sdpa_ms / ours_ms if ours_ms > 0 else float("inf")
+                print(
+                    f"  {head_dim:>6} {nkvh:>8} {nqh:>8} {bs:>8} "
+                    f"{kvl:>8} {ours_ms*1000:>10.1f} {sdpa_ms*1000:>10.1f} "
+                    f"{speedup:>7.2f}x"
+                )
