@@ -6,6 +6,7 @@
 #include "moe_utils.h"
 #include "store_kv_cache.h"
 #include "fast_compare_key.h"
+#include "gdn_state.h"
 #include "paged_decode_attention.h"
 #include "paged_prefill_attention.h"
 namespace nb = nanobind;
@@ -49,5 +50,19 @@ NB_MODULE(_ext, m) {
             "def paged_prefill_attention(q: array, k_cache: array, v_cache: array, "
             "qo_indptr: array, kv_indptr: array, kv_indices: array, "
             "prefix_lens: array, sm_scale: float, max_len_extend: int, "
+            "*, stream: Union[None, Stream, Device] = None) -> array"));
+  m.def("gdn_decode_inplace", &mlx_serve::gdn_decode_inplace,
+        "q"_a, "k"_a, "v"_a, "g"_a, "beta"_a, "state"_a, "slot_ids"_a,
+        nb::kw_only(), "stream"_a = nb::none(),
+        nb::sig(
+            "def gdn_decode_inplace(q: array, k: array, v: array, g: array, "
+            "beta: array, state: array, slot_ids: array, "
+            "*, stream: Union[None, Stream, Device] = None) -> array"));
+  m.def("gdn_prefill_inplace", &mlx_serve::gdn_prefill_inplace,
+        "q"_a, "k"_a, "v"_a, "g"_a, "beta"_a, "state"_a, "slot_ids"_a,
+        "qo_indptr"_a, nb::kw_only(), "stream"_a = nb::none(),
+        nb::sig(
+            "def gdn_prefill_inplace(q: array, k: array, v: array, g: array, "
+            "beta: array, state: array, slot_ids: array, qo_indptr: array, "
             "*, stream: Union[None, Stream, Device] = None) -> array"));
 }

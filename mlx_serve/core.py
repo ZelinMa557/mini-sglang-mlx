@@ -78,6 +78,7 @@ class Batch:
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
     mamba_slot_ids: mx.array | None = field(default=None, init=False, repr=False)
+    mamba_prefill_indptr: mx.array | None = field(default=None, init=False, repr=False)
 
     @property
     def is_prefill(self) -> bool:
