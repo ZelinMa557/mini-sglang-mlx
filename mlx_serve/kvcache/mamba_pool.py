@@ -25,7 +25,7 @@ class MambaStateConfig:
     num_layers: int
     conv_shapes: List[List[tuple]]  # per-layer list of conv shapes
     temporal_shapes: List[tuple]  # per-layer temporal shape
-    dtype: mx.Dtype = mx.float16
+    dtype: mx.Dtype = mx.float32
 
 
 class MambaStatePool:
@@ -47,7 +47,7 @@ class MambaStatePool:
             layer_convs: List[mx.array] = []
             for conv_shape in config.conv_shapes[layer_idx]:
                 buf = mx.zeros(
-                    (config.num_slots + 1, *conv_shape), dtype=config.dtype
+                    (config.num_slots + 1, *conv_shape), dtype=mx.bfloat16
                 )
                 layer_convs.append(buf)
             self._conv_buffers.append(layer_convs)
