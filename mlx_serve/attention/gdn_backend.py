@@ -71,7 +71,6 @@ class GDNBackend:
         Prefill: q/k/v/g/beta are ragged [total_tokens, ...].
         Decode:  q/k/v/g/beta are ragged [B, ...] (1 token each).
         """
-        self.prepare_batch(batch)
         if batch.is_prefill:
             return self._forward_prefill(
                 q, k, v, g, beta, linear_layer_idx, batch,
@@ -93,7 +92,6 @@ class GDNBackend:
         linear_layer_idx: int,
         batch: "Batch",
     ) -> mx.array:
-        self.prepare_batch(batch)
         temporal_buf = self.mamba_pool.temporal_state(linear_layer_idx)
         assert batch.mamba_slot_ids is not None
         assert batch.mamba_prefill_indptr is not None
@@ -116,7 +114,6 @@ class GDNBackend:
         linear_layer_idx: int,
         batch: "Batch",
     ) -> mx.array:
-        self.prepare_batch(batch)
         assert batch.mamba_slot_ids is not None
         temporal_buf = self.mamba_pool.temporal_state(linear_layer_idx)
         return gdn_decode_inplace(

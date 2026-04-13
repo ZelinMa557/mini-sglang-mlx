@@ -157,6 +157,8 @@ class Scheduler(SchedulerIOMixin):
 
         batch.input_ids = mx.concatenate(input_chunks) if input_chunks else mx.array([], dtype=mx.int32)
         self.engine.attn_backend.prepare_metadata(batch)
+        if self.engine.gdn_backend is not None:
+            self.engine.gdn_backend.prepare_batch(batch)
         return ForwardInput(batch=batch, sample_args=self.engine.sampler.prepare(batch))
 
     def _schedule_next_batch(self) -> ForwardInput | None:

@@ -11,12 +11,12 @@ namespace mlx_serve {
 
 // Fused single-step GatedDeltaNet recurrence.
 //
-// q, k:      (batch, hk, dk)
-// v:         (batch, hv, dv)
-// g, beta:   (batch, hv)
-// state:     (num_slots, hv, dv, dk), updated in-place at slot_ids[b]
+// q, k:      (batch, hk, dk) bfloat16
+// v:         (batch, hv, dv) bfloat16
+// g, beta:   (batch, hv) bfloat16
+// state:     (num_slots, hv, dv, dk) float32, updated in-place at slot_ids[b]
 // slot_ids:  (batch,) int32
-// returns y: (batch, hv, dv)
+// returns y: (batch, hv, dv) bfloat16
 mx::array gdn_decode_inplace(
     const mx::array& q,
     const mx::array& k,
@@ -29,13 +29,13 @@ mx::array gdn_decode_inplace(
 
 // Fused variable-length prefill GatedDeltaNet recurrence.
 //
-// q, k:       (total_tokens, hk, dk)
-// v:          (total_tokens, hv, dv)
-// g, beta:    (total_tokens, hv)
-// state:      (num_slots, hv, dv, dk), updated in-place at slot_ids[b]
+// q, k:       (total_tokens, hk, dk) bfloat16
+// v:          (total_tokens, hv, dv) bfloat16
+// g, beta:    (total_tokens, hv) bfloat16
+// state:      (num_slots, hv, dv, dk) float32, updated in-place at slot_ids[b]
 // slot_ids:   (batch,) int32
 // qo_indptr:  (batch + 1,) int32 cumulative token offsets
-// returns y:  (total_tokens, hv, dv)
+// returns y:  (total_tokens, hv, dv) bfloat16
 mx::array gdn_prefill_inplace(
     const mx::array& q,
     const mx::array& k,

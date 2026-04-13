@@ -130,7 +130,6 @@ class Engine:
             num_layers=num_linear_layers,
             conv_shapes=conv_shapes,
             temporal_shapes=temporal_shapes,
-            dtype=self.dtype,
         )
         return MambaStatePool(pool_config)
 

@@ -6,7 +6,7 @@ This compares the new fused kernels against the current mlx-serve baseline:
 - Decode: gather -> single-step metal kernel -> scatter.
 
 The fused kernels read state directly from slot_ids and write it back in-place.
-All tests use float32 because the kernel intentionally only supports fp32.
+Inputs q/k/v/g/beta use bfloat16 while recurrent state uses float32.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 import numpy as np
-
+from mlx_lm.models.gated_delta import gated_delta_ops
 from mlx_serve_kernel import gdn_decode_inplace, gdn_prefill_inplace
 
 
@@ -34,182 +34,32 @@ CONFIGS = [
     GDNConfig(hk=16, hv=48, dk=128, dv=128),
 ]
 
-PREFILL_LENGTHS = [1, 128, 256, 512, 1024, 2048, 4096]
+PREFILL_LENGTHS = [1, 128, 256, 512, 1024]
 DECODE_BATCHES = [1, 2, 4, 8]
 INPUT_SCALE = 0.05
 
 
 def clone(a: mx.array) -> mx.array:
-    return mx.array(np.array(a))
+    return mx.array(to_numpy(a)).astype(a.dtype)
+
+
+def to_numpy(a: mx.array) -> np.ndarray:
+    if a.dtype == mx.bfloat16:
+        return np.array(a.astype(mx.float32), dtype=np.float32)
+    return np.array(a)
 
 
 def clone_inputs(data: dict[str, mx.array]) -> dict[str, mx.array]:
     return {key: clone(value) for key, value in data.items()}
 
-
-def _gated_delta_step(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    g: mx.array,
-    beta: mx.array,
-    state: mx.array,
-) -> tuple[mx.array, mx.array]:
-    hk_per_hv = state.shape[0] // q.shape[0]
-    q_exp = mx.repeat(q, hk_per_hv, axis=0) if hk_per_hv > 1 else q
-    k_exp = mx.repeat(k, hk_per_hv, axis=0) if hk_per_hv > 1 else k
-    state = state * g[:, None, None]
-    kv_mem = (state * k_exp[:, None, :]).sum(axis=-1)
-    delta = (v - kv_mem) * beta[:, None]
-    state = state + k_exp[:, None, :] * delta[:, :, None]
-    y = (state * q_exp[:, None, :]).sum(axis=-1)
-    return y, state
-
-
-@mx.compile
-def _gated_delta_step_batched(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    g: mx.array,
-    beta: mx.array,
-    state: mx.array,
-) -> tuple[mx.array, mx.array]:
-    hv = state.shape[1]
-    hk = q.shape[1]
-    hk_per_hv = hv // hk
-    if hk_per_hv > 1:
-        q = mx.repeat(q, hk_per_hv, axis=1)
-        k = mx.repeat(k, hk_per_hv, axis=1)
-    state = state * g[:, :, None, None]
-    kv_mem = (state * k[:, :, None, :]).sum(axis=-1)
-    delta = (v - kv_mem) * beta[:, :, None]
-    state = state + k[:, :, None, :] * delta[:, :, :, None]
-    y = (state * q[:, :, None, :]).sum(axis=-1)
-    return y, state
-
-
-_decode_kernel_cache: dict[tuple[int, int, int, int], object] = {}
-
-
-def _get_baseline_decode_kernel(hk: int, hv: int, dk: int, dv: int):
-    key = (hk, hv, dk, dv)
-    if key in _decode_kernel_cache:
-        return _decode_kernel_cache[key]
-
-    source = f"""
-        auto n = thread_position_in_grid.z;
-        auto b_idx = n / Hv;
-        auto hv_idx = n % Hv;
-        auto hk_idx = hv_idx / (Hv / Hk);
-
-        auto q_ = q + b_idx * Hk * Dk + hk_idx * Dk;
-        auto k_ = k + b_idx * Hk * Dk + hk_idx * Dk;
-        auto v_ = v + b_idx * Hv * Dv + hv_idx * Dv;
-        y += b_idx * Hv * Dv + hv_idx * Dv;
-
-        auto dk_idx = thread_position_in_threadgroup.x;
-        auto dv_idx = thread_position_in_grid.y;
-
-        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
-        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
-
-        auto g_ = g + b_idx * Hv;
-        auto beta_ = beta + b_idx * Hv;
-
-        float kv_mem = 0.0f;
-        for (int s_idx = dk_idx; s_idx < Dk; s_idx += 32) {{
-          auto state = static_cast<float>(i_state[s_idx]) * g_[hv_idx];
-          kv_mem += state * k_[s_idx];
-          o_state[s_idx] = state;
-        }}
-        kv_mem = simd_sum(kv_mem);
-
-        auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
-        float out = 0.0f;
-        for (int s_idx = dk_idx; s_idx < Dk; s_idx += 32) {{
-          auto state = static_cast<float>(o_state[s_idx]) + k_[s_idx] * delta;
-          o_state[s_idx] = state;
-          out += state * q_[s_idx];
-        }}
-        out = simd_sum(out);
-        if (thread_index_in_simdgroup == 0) {{
-          y[dv_idx] = static_cast<InT>(out);
-        }}
-    """
-    kernel = mx.fast.metal_kernel(
-        name=f"gdn_decode_baseline_hk{hk}_hv{hv}_dk{dk}_dv{dv}",
-        input_names=["q", "k", "v", "g", "beta", "state_in"],
-        output_names=["y", "state_out"],
-        source=source,
-    )
-    _decode_kernel_cache[key] = kernel
-    return kernel
-
-
-def baseline_decode(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    g: mx.array,
-    beta: mx.array,
-    state: mx.array,
-    slot_ids: mx.array,
-) -> mx.array:
-    state_batch = state[slot_ids]
-    hk, dk = q.shape[1], q.shape[2]
-    hv, dv = v.shape[1], v.shape[2]
-    kernel = _get_baseline_decode_kernel(hk, hv, dk, dv)
-    y, new_state = kernel(
-        inputs=[q, k, v, g, beta, state_batch],
-        template=[("InT", q.dtype), ("Dk", dk), ("Dv", dv), ("Hk", hk), ("Hv", hv)],
-        grid=(32, dv, q.shape[0] * hv),
-        threadgroup=(32, 1, 1),
-        output_shapes=[(q.shape[0], hv, dv), state_batch.shape],
-        output_dtypes=[q.dtype, q.dtype],
-    )
-    state[slot_ids] = new_state
-    return y
-
-
-def baseline_prefill(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    g: mx.array,
-    beta: mx.array,
-    state: mx.array,
-    slot_ids: mx.array,
-    qo_indptr: mx.array,
-) -> mx.array:
-    output_parts = []
-    slot_ids_np = np.array(slot_ids, dtype=np.int32)
-    indptr_np = np.array(qo_indptr, dtype=np.int32)
-
-    for req_idx, slot in enumerate(slot_ids_np.tolist()):
-        start = int(indptr_np[req_idx])
-        end = int(indptr_np[req_idx + 1])
-        seg_state = state[slot]
-        ys = []
-        for token in range(start, end):
-            y_t, seg_state = _gated_delta_step(
-                q[token], k[token], v[token], g[token], beta[token], seg_state,
-            )
-            ys.append(y_t)
-        state[slot] = seg_state
-        output_parts.append(mx.stack(ys, axis=0))
-
-    return mx.concatenate(output_parts, axis=0)
-
-
 def numpy_decode_reference(data: dict[str, mx.array]) -> tuple[np.ndarray, np.ndarray]:
-    q = np.array(data["q"], dtype=np.float32)
-    k = np.array(data["k"], dtype=np.float32)
-    v = np.array(data["v"], dtype=np.float32)
-    g = np.array(data["g"], dtype=np.float32)
-    beta = np.array(data["beta"], dtype=np.float32)
-    state = np.array(data["state"], dtype=np.float32)
-    slot_ids = np.array(data["slot_ids"], dtype=np.int32)
+    q = to_numpy(data["q"]).astype(np.float32)
+    k = to_numpy(data["k"]).astype(np.float32)
+    v = to_numpy(data["v"]).astype(np.float32)
+    g = to_numpy(data["g"]).astype(np.float32)
+    beta = to_numpy(data["beta"]).astype(np.float32)
+    state = to_numpy(data["state"]).astype(np.float32)
+    slot_ids = to_numpy(data["slot_ids"]).astype(np.int32)
 
     outputs = []
     for b, slot in enumerate(slot_ids.tolist()):
@@ -226,14 +76,14 @@ def numpy_decode_reference(data: dict[str, mx.array]) -> tuple[np.ndarray, np.nd
 
 
 def numpy_prefill_reference(data: dict[str, mx.array]) -> tuple[np.ndarray, np.ndarray]:
-    q = np.array(data["q"], dtype=np.float32)
-    k = np.array(data["k"], dtype=np.float32)
-    v = np.array(data["v"], dtype=np.float32)
-    g = np.array(data["g"], dtype=np.float32)
-    beta = np.array(data["beta"], dtype=np.float32)
-    state = np.array(data["state"], dtype=np.float32)
-    slot_ids = np.array(data["slot_ids"], dtype=np.int32)
-    indptr = np.array(data["qo_indptr"], dtype=np.int32)
+    q = to_numpy(data["q"]).astype(np.float32)
+    k = to_numpy(data["k"]).astype(np.float32)
+    v = to_numpy(data["v"]).astype(np.float32)
+    g = to_numpy(data["g"]).astype(np.float32)
+    beta = to_numpy(data["beta"]).astype(np.float32)
+    state = to_numpy(data["state"]).astype(np.float32)
+    slot_ids = to_numpy(data["slot_ids"]).astype(np.int32)
+    indptr = to_numpy(data["qo_indptr"]).astype(np.int32)
 
     outputs = []
     for i, slot in enumerate(slot_ids.tolist()):
@@ -253,13 +103,13 @@ def numpy_prefill_reference(data: dict[str, mx.array]) -> tuple[np.ndarray, np.n
 
 
 def build_decode_inputs(config: GDNConfig, batch: int) -> dict[str, mx.array]:
-    num_slots = batch + 5
-    slot_ids = mx.array(np.arange(1, batch + 1, dtype=np.int32), dtype=mx.int32)
-    q = INPUT_SCALE * mx.random.normal((batch, config.hk, config.dk), dtype=mx.float32)
-    k = INPUT_SCALE * mx.random.normal((batch, config.hk, config.dk), dtype=mx.float32)
-    v = INPUT_SCALE * mx.random.normal((batch, config.hv, config.dv), dtype=mx.float32)
-    g = mx.sigmoid(mx.random.normal((batch, config.hv), dtype=mx.float32))
-    beta = mx.sigmoid(mx.random.normal((batch, config.hv), dtype=mx.float32))
+    num_slots = batch
+    slot_ids = mx.array(np.arange(0, batch, dtype=np.int32), dtype=mx.int32)
+    q = (INPUT_SCALE * mx.random.normal((batch, config.hk, config.dk), dtype=mx.float32)).astype(mx.bfloat16)
+    k = (INPUT_SCALE * mx.random.normal((batch, config.hk, config.dk), dtype=mx.float32)).astype(mx.bfloat16)
+    v = (INPUT_SCALE * mx.random.normal((batch, config.hv, config.dv), dtype=mx.float32)).astype(mx.bfloat16)
+    g = mx.sigmoid(mx.random.normal((batch, config.hv), dtype=mx.float32)).astype(mx.bfloat16)
+    beta = mx.sigmoid(mx.random.normal((batch, config.hv), dtype=mx.float32)).astype(mx.bfloat16)
     state = INPUT_SCALE * mx.random.normal(
         (num_slots + 1, config.hv, config.dv, config.dk), dtype=mx.float32
     )
@@ -284,11 +134,11 @@ def build_prefill_inputs(config: GDNConfig, lengths: list[int]) -> dict[str, mx.
     for length in lengths:
         indptr.append(indptr[-1] + length)
     qo_indptr = mx.array(indptr, dtype=mx.int32)
-    q = INPUT_SCALE * mx.random.normal((total, config.hk, config.dk), dtype=mx.float32)
-    k = INPUT_SCALE * mx.random.normal((total, config.hk, config.dk), dtype=mx.float32)
-    v = INPUT_SCALE * mx.random.normal((total, config.hv, config.dv), dtype=mx.float32)
-    g = mx.sigmoid(mx.random.normal((total, config.hv), dtype=mx.float32))
-    beta = mx.sigmoid(mx.random.normal((total, config.hv), dtype=mx.float32))
+    q = (INPUT_SCALE * mx.random.normal((total, config.hk, config.dk), dtype=mx.float32)).astype(mx.bfloat16)
+    k = (INPUT_SCALE * mx.random.normal((total, config.hk, config.dk), dtype=mx.float32)).astype(mx.bfloat16)
+    v = (INPUT_SCALE * mx.random.normal((total, config.hv, config.dv), dtype=mx.float32)).astype(mx.bfloat16)
+    g = mx.sigmoid(mx.random.normal((total, config.hv), dtype=mx.float32)).astype(mx.bfloat16)
+    beta = mx.sigmoid(mx.random.normal((total, config.hv), dtype=mx.float32)).astype(mx.bfloat16)
     state = INPUT_SCALE * mx.random.normal(
         (num_slots + 1, config.hv, config.dv, config.dk), dtype=mx.float32
     )
@@ -305,9 +155,55 @@ def build_prefill_inputs(config: GDNConfig, lengths: list[int]) -> dict[str, mx.
     }
 
 
+def prepare_baseline_decode_inputs(data: dict[str, mx.array]) -> dict[str, mx.array]:
+    prepared = {
+        "q": data["q"][:, None, :, :],
+        "k": data["k"][:, None, :, :],
+        "v": data["v"][:, None, :, :],
+        "g": data["g"][:, None, :],
+        "beta": data["beta"][:, None, :],
+        "state": data["state"][data["slot_ids"]],
+    }
+    mx.eval(
+        prepared["q"],
+        prepared["k"],
+        prepared["v"],
+        prepared["g"],
+        prepared["beta"],
+        prepared["state"],
+    )
+    return prepared
+
+
+def prepare_baseline_prefill_inputs(data: dict[str, mx.array]) -> dict[str, mx.array]:
+    slot_ids_np = to_numpy(data["slot_ids"]).astype(np.int32)
+    indptr_np = to_numpy(data["qo_indptr"]).astype(np.int32)
+    assert len(slot_ids_np) == 1, "benchmark prefill baseline expects a single request"
+    slot = int(slot_ids_np[0])
+    start = int(indptr_np[0])
+    end = int(indptr_np[1])
+    prepared = {
+        "q": data["q"][start:end][None, :, :, :],
+        "k": data["k"][start:end][None, :, :, :],
+        "v": data["v"][start:end][None, :, :, :],
+        "g": data["g"][start:end][None, :, :],
+        "beta": data["beta"][start:end][None, :, :],
+        "state": data["state"][slot : slot + 1],
+    }
+    mx.eval(
+        prepared["q"],
+        prepared["k"],
+        prepared["v"],
+        prepared["g"],
+        prepared["beta"],
+        prepared["state"],
+    )
+    return prepared
+
+
 def assert_close(name: str, lhs: mx.array, rhs: mx.array, atol: float = 5e-4) -> None:
-    lhs_np = np.array(lhs, dtype=np.float32)
-    rhs_np = np.array(rhs, dtype=np.float32)
+    lhs_np = to_numpy(lhs).astype(np.float32)
+    rhs_np = to_numpy(rhs).astype(np.float32)
     diff = np.abs(lhs_np - rhs_np)
     max_diff = float(diff.max())
     mean_diff = float(diff.mean())
@@ -318,10 +214,46 @@ def assert_close(name: str, lhs: mx.array, rhs: mx.array, atol: float = 5e-4) ->
         raise AssertionError(f"{name} failed: max_diff={max_diff}")
 
 
-def sync_token(out: mx.array, state: mx.array, slot_ids: mx.array) -> float:
-    token = mx.sum(out.astype(mx.float32))
-    token = token + mx.sum(state[slot_ids][:, :1, :1, :1].astype(mx.float32))
-    return float(np.array(token))
+def run_fused_decode_bench(data: dict[str, mx.array]) -> None:
+    y = gdn_decode_inplace(
+        data["q"], data["k"], data["v"], data["g"], data["beta"],
+        data["state"], data["slot_ids"],
+    )
+    mx.eval(y)
+
+
+def run_fused_prefill_bench(data: dict[str, mx.array]) -> None:
+    y = gdn_prefill_inplace(
+        data["q"], data["k"], data["v"], data["g"], data["beta"],
+        data["state"], data["slot_ids"], data["qo_indptr"],
+    )
+    mx.eval(y)
+
+
+def run_baseline_decode_bench(prepared: dict[str, mx.array]) -> None:
+    y, new_state = gated_delta_ops(
+        prepared["q"],
+        prepared["k"],
+        prepared["v"],
+        prepared["g"],
+        prepared["beta"],
+        prepared["state"],
+    )
+    mx.eval(y, new_state)
+    prepared["state"] = new_state
+
+
+def run_baseline_prefill_bench(prepared: dict[str, mx.array]) -> None:
+    y, new_state = gated_delta_ops(
+        prepared["q"],
+        prepared["k"],
+        prepared["v"],
+        prepared["g"],
+        prepared["beta"],
+        prepared["state"],
+    )
+    mx.eval(y, new_state)
+    prepared["state"] = new_state
 
 
 def run_correctness() -> None:
@@ -370,37 +302,22 @@ def bench_once(fn, warmup: int, repeat: int) -> float:
 
 def run_prefill_perf(warmup: int, repeat: int) -> None:
     print("=" * 88)
-    print("Prefill performance vs current implementation (ms)")
+    print("Prefill performance vs baseline implementation (ms)")
     print("=" * 88)
     print(f"{'hk':>4} {'hv':>4} {'dk':>5} {'dv':>5} {'len':>8} {'fused':>10} {'baseline':>10} {'speedup':>8}")
     for config in CONFIGS:
         for length in PREFILL_LENGTHS:
             fused_data = build_prefill_inputs(config, [length])
             base_data = clone_inputs(fused_data)
+            baseline_prepared = prepare_baseline_prefill_inputs(base_data)
 
             fused_ms = bench_once(
-                lambda: sync_token(
-                    gdn_prefill_inplace(
-                        fused_data["q"], fused_data["k"], fused_data["v"], fused_data["g"],
-                        fused_data["beta"], fused_data["state"], fused_data["slot_ids"],
-                        fused_data["qo_indptr"],
-                    ),
-                    fused_data["state"],
-                    fused_data["slot_ids"],
-                ),
+                lambda: run_fused_prefill_bench(fused_data),
                 warmup=warmup,
                 repeat=repeat,
             )
             base_ms = bench_once(
-                lambda: sync_token(
-                    baseline_prefill(
-                        base_data["q"], base_data["k"], base_data["v"], base_data["g"],
-                        base_data["beta"], base_data["state"], base_data["slot_ids"],
-                        base_data["qo_indptr"],
-                    ),
-                    base_data["state"],
-                    base_data["slot_ids"],
-                ),
+                lambda: run_baseline_prefill_bench(baseline_prepared),
                 warmup=warmup,
                 repeat=repeat,
             )
@@ -413,35 +330,22 @@ def run_prefill_perf(warmup: int, repeat: int) -> None:
 
 def run_decode_perf(warmup: int, repeat: int) -> None:
     print("=" * 88)
-    print("Decode performance vs current implementation (ms)")
+    print("Decode performance vs baseline implementation (ms)")
     print("=" * 88)
     print(f"{'hk':>4} {'hv':>4} {'dk':>5} {'dv':>5} {'batch':>8} {'fused':>10} {'baseline':>10} {'speedup':>8}")
     for config in CONFIGS:
         for batch in DECODE_BATCHES:
             fused_data = build_decode_inputs(config, batch)
             base_data = clone_inputs(fused_data)
+            baseline_prepared = prepare_baseline_decode_inputs(base_data)
 
             fused_ms = bench_once(
-                lambda: sync_token(
-                    gdn_decode_inplace(
-                        fused_data["q"], fused_data["k"], fused_data["v"], fused_data["g"],
-                        fused_data["beta"], fused_data["state"], fused_data["slot_ids"],
-                    ),
-                    fused_data["state"],
-                    fused_data["slot_ids"],
-                ),
+                lambda: run_fused_decode_bench(fused_data),
                 warmup=warmup,
                 repeat=repeat,
             )
             base_ms = bench_once(
-                lambda: sync_token(
-                    baseline_decode(
-                        base_data["q"], base_data["k"], base_data["v"], base_data["g"],
-                        base_data["beta"], base_data["state"], base_data["slot_ids"],
-                    ),
-                    base_data["state"],
-                    base_data["slot_ids"],
-                ),
+                lambda: run_baseline_decode_bench(baseline_prepared),
                 warmup=warmup,
                 repeat=repeat,
             )

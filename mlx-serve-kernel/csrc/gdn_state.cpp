@@ -43,11 +43,15 @@ void validate_common_inputs(
     throw std::runtime_error(
         std::string(op_name) + ": slot_ids must be int32 1D");
   }
-  if (q.dtype() != mx::float32 || k.dtype() != mx::float32 ||
-      v.dtype() != mx::float32 || g.dtype() != mx::float32 ||
-      beta.dtype() != mx::float32 || state.dtype() != mx::float32) {
+  if (q.dtype() != mx::bfloat16 || k.dtype() != mx::bfloat16 ||
+      v.dtype() != mx::bfloat16 || g.dtype() != mx::bfloat16 ||
+      beta.dtype() != mx::bfloat16) {
     throw std::runtime_error(
-        std::string(op_name) + ": only float32 inputs are supported");
+        std::string(op_name) + ": q/k/v/g/beta must be bfloat16");
+  }
+  if (state.dtype() != mx::float32) {
+    throw std::runtime_error(
+        std::string(op_name) + ": state must be float32");
   }
   if (q.shape(0) != k.shape(0) || q.shape(0) != v.shape(0) ||
       q.shape(0) != g.shape(0) || q.shape(0) != beta.shape(0)) {
@@ -104,7 +108,7 @@ mx::array gdn_decode_inplace(
   auto s = to_stream(s_);
   return mx::array(
       {batch, hv, dv},
-      mx::float32,
+      q.dtype(),
       std::make_shared<GDNDecodeInplace>(s, hk, hv, dk, dv),
       {q, k, v, g, beta, state, slot_ids});
 }
@@ -141,7 +145,7 @@ mx::array gdn_prefill_inplace(
   auto s = to_stream(s_);
   return mx::array(
       {total_tokens, hv, dv},
-      mx::float32,
+      q.dtype(),
       std::make_shared<GDNPrefillInplace>(s, hk, hv, dk, dv),
       {q, k, v, g, beta, state, slot_ids, qo_indptr});
 }

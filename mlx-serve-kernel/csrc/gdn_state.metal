@@ -9,12 +9,12 @@ METAL_FUNC float sum4(float4 x) {
 
 [[kernel]] void gdn_decode_inplace_float32(
     device float* state,
-    device float* y,
-    const device float* q,
-    const device float* k,
-    const device float* v,
-    const device float* g,
-    const device float* beta,
+    device bfloat16_t* y,
+    const device bfloat16_t* q,
+    const device bfloat16_t* k,
+    const device bfloat16_t* v,
+    const device bfloat16_t* g,
+    const device bfloat16_t* beta,
     const device int32_t* slot_ids,
     constant uint& batch,
     constant uint& hk,
@@ -43,20 +43,18 @@ METAL_FUNC float sum4(float4 x) {
   const uint hk_idx = hv_idx / hk_per_hv;
   const uint slot = static_cast<uint>(slot_ids[b_idx]);
 
-  const device float* q_ptr =
+  const device bfloat16_t* q_ptr =
       q + size_t(b_idx) * size_t(q_batch_stride) + size_t(hk_idx) * size_t(dk);
-  const device float* k_ptr =
+  const device bfloat16_t* k_ptr =
       k + size_t(b_idx) * size_t(q_batch_stride) + size_t(hk_idx) * size_t(dk);
-  const device float* v_ptr =
+  const device bfloat16_t* v_ptr =
       v + size_t(b_idx) * size_t(v_batch_stride) + size_t(hv_idx) * size_t(dv);
-  const device float* g_ptr = g + size_t(b_idx) * size_t(hv) + size_t(hv_idx);
-  const device float* beta_ptr =
+  const device bfloat16_t* g_ptr = g + size_t(b_idx) * size_t(hv) + size_t(hv_idx);
+  const device bfloat16_t* beta_ptr =
       beta + size_t(b_idx) * size_t(hv) + size_t(hv_idx);
   device float* state_ptr =
       state + size_t(slot) * size_t(state_slot_stride) +
       size_t(hv_idx * dv + dv_idx) * size_t(dk);
-  const device float4* q4_ptr = reinterpret_cast<const device float4*>(q_ptr);
-  const device float4* k4_ptr = reinterpret_cast<const device float4*>(k_ptr);
   device float4* state4_ptr = reinterpret_cast<device float4*>(state_ptr);
   const uint dk_vec = dk / 4;
   threadgroup float4* q_pack4 = reinterpret_cast<threadgroup float4*>(qk_pack_raw);
@@ -64,20 +62,30 @@ METAL_FUNC float sum4(float4 x) {
 
   if (tid.y == 0) {
     for (uint c = lane; c < dk_vec; c += 32) {
-      q_pack4[c] = q4_ptr[c];
-      k_pack4[c] = k4_ptr[c];
+      const uint base = c * 4;
+      q_pack4[c] = float4(
+          static_cast<float>(q_ptr[base + 0]),
+          static_cast<float>(q_ptr[base + 1]),
+          static_cast<float>(q_ptr[base + 2]),
+          static_cast<float>(q_ptr[base + 3]));
+      k_pack4[c] = float4(
+          static_cast<float>(k_ptr[base + 0]),
+          static_cast<float>(k_ptr[base + 1]),
+          static_cast<float>(k_ptr[base + 2]),
+          static_cast<float>(k_ptr[base + 3]));
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   float kv_partial = 0.0f;
   for (uint c = lane; c < dk_vec; c += 32) {
-    const float4 s = state4_ptr[c] * g_ptr[0];
+    const float4 s = state4_ptr[c] * static_cast<float>(g_ptr[0]);
     state4_ptr[c] = s;
     kv_partial += sum4(s * k_pack4[c]);
   }
   const float kv_mem = simd_sum(kv_partial);
-  const float delta = (v_ptr[dv_idx] - kv_mem) * beta_ptr[0];
+  const float delta =
+      (static_cast<float>(v_ptr[dv_idx]) - kv_mem) * static_cast<float>(beta_ptr[0]);
 
   float out_partial = 0.0f;
   for (uint c = lane; c < dk_vec; c += 32) {
@@ -87,18 +95,19 @@ METAL_FUNC float sum4(float4 x) {
   }
   const float out = simd_sum(out_partial);
   if (simd_lane == 0) {
-    y[(size_t(b_idx) * size_t(hv) + size_t(hv_idx)) * size_t(dv) + size_t(dv_idx)] = out;
+    y[(size_t(b_idx) * size_t(hv) + size_t(hv_idx)) * size_t(dv) + size_t(dv_idx)] =
+        static_cast<bfloat16_t>(out);
   }
 }
 
 [[kernel]] void gdn_prefill_inplace_float32(
     device float* state,
-    device float* y,
-    const device float* q,
-    const device float* k,
-    const device float* v,
-    const device float* g,
-    const device float* beta,
+    device bfloat16_t* y,
+    const device bfloat16_t* q,
+    const device bfloat16_t* k,
+    const device bfloat16_t* v,
+    const device bfloat16_t* g,
+    const device bfloat16_t* beta,
     const device float* state_in,
     const device int32_t* slot_ids,
     const device int32_t* qo_indptr,
@@ -148,35 +157,54 @@ METAL_FUNC float sum4(float4 x) {
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
   for (int token = start; token < end; ++token) {
-    const device float* q_ptr =
+    const device bfloat16_t* q_ptr =
         q + size_t(token) * size_t(q_token_stride) + size_t(hk_idx) * size_t(dk);
-    const device float* k_ptr =
+    const device bfloat16_t* k_ptr =
         k + size_t(token) * size_t(q_token_stride) + size_t(hk_idx) * size_t(dk);
-    const device float* v_ptr =
+    const device bfloat16_t* v_ptr =
         v + size_t(token) * size_t(v_token_stride) + size_t(hv_idx) * size_t(dv);
-    const device float4* q4_ptr = reinterpret_cast<const device float4*>(q_ptr);
-    const device float4* k4_ptr = reinterpret_cast<const device float4*>(k_ptr);
-    const float g_scalar = g[size_t(token) * size_t(hv) + size_t(hv_idx)];
-    const float beta_scalar = beta[size_t(token) * size_t(hv) + size_t(hv_idx)];
+    const float g_scalar =
+        static_cast<float>(g[size_t(token) * size_t(hv) + size_t(hv_idx)]);
+    const float beta_scalar =
+        static_cast<float>(beta[size_t(token) * size_t(hv) + size_t(hv_idx)]);
 
     float kv_partial = 0.0f;
     for (uint c = lane; c < dk_vec; c += 32) {
+      const uint base = c * 4;
+      const float4 k4 = float4(
+          static_cast<float>(k_ptr[base + 0]),
+          static_cast<float>(k_ptr[base + 1]),
+          static_cast<float>(k_ptr[base + 2]),
+          static_cast<float>(k_ptr[base + 3]));
       const float4 s = local_state4[c] * g_scalar;
       local_state4[c] = s;
-      kv_partial += sum4(s * k4_ptr[c]);
+      kv_partial += sum4(s * k4);
     }
     const float kv_mem = simd_sum(kv_partial);
-    const float delta = (v_ptr[dv_idx] - kv_mem) * beta_scalar;
+    const float delta =
+        (static_cast<float>(v_ptr[dv_idx]) - kv_mem) * beta_scalar;
 
     float out_partial = 0.0f;
     for (uint c = lane; c < dk_vec; c += 32) {
-      const float4 s = local_state4[c] + k4_ptr[c] * delta;
+      const uint base = c * 4;
+      const float4 q4 = float4(
+          static_cast<float>(q_ptr[base + 0]),
+          static_cast<float>(q_ptr[base + 1]),
+          static_cast<float>(q_ptr[base + 2]),
+          static_cast<float>(q_ptr[base + 3]));
+      const float4 k4 = float4(
+          static_cast<float>(k_ptr[base + 0]),
+          static_cast<float>(k_ptr[base + 1]),
+          static_cast<float>(k_ptr[base + 2]),
+          static_cast<float>(k_ptr[base + 3]));
+      const float4 s = local_state4[c] + k4 * delta;
       local_state4[c] = s;
-      out_partial += sum4(s * q4_ptr[c]);
+      out_partial += sum4(s * q4);
     }
     const float out = simd_sum(out_partial);
     if (simd_lane == 0) {
-      y[(size_t(token) * size_t(hv) + size_t(hv_idx)) * size_t(dv) + size_t(dv_idx)] = out;
+      y[(size_t(token) * size_t(hv) + size_t(hv_idx)) * size_t(dv) + size_t(dv_idx)] =
+          static_cast<bfloat16_t>(out);
     }
   }
 

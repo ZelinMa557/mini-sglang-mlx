@@ -215,13 +215,10 @@ class GatedDeltaNet(nn.Module):
         z = self.in_proj_z(x).reshape(L, -1, self.head_v_dim)  # [L, Hv, Dv]
         b = self.in_proj_b(x)                                  # [L, Hv]
         a = self.in_proj_a(x)                                  # [L, Hv]
-
         if batch.is_decode:
-            gdn_backend.prepare_batch(batch)
             conv_out = self._apply_conv_decode(mixed_qkv, batch, mamba_pool)
         else:
             conv_out = self._apply_conv_prefill(mixed_qkv, batch, mamba_pool)
-
         q = conv_out[:, : self.key_dim].reshape(L, self.num_k_heads, self.head_k_dim)
         k = conv_out[:, self.key_dim : 2 * self.key_dim].reshape(L, self.num_k_heads, self.head_k_dim)
         v = conv_out[:, 2 * self.key_dim :].reshape(L, self.num_v_heads, self.head_v_dim)
