@@ -136,31 +136,13 @@ void PagedPrefillAttention::eval_gpu(
   compute_encoder.set_bytes(num_q_heads_, 9);
   compute_encoder.set_bytes(num_kv_heads_, 10);
 
-  // Shared memory size:
-  // - Q block stays resident
-  // - K/V are streamed as 32x32 tensor-op sub-tiles
-  constexpr int BLOCK_M = 16;
-  constexpr int BLOCK_N = 32;
-  constexpr int NSG = 4;
-  constexpr int MMA_K = 32;
-  constexpr int MMA_DV = 32;
-  constexpr size_t T_SIZE = 2; // sizeof(half) == sizeof(bfloat16_t)
-  size_t shmem_size = BLOCK_M * head_dim_ * T_SIZE +         // sq
-                      BLOCK_M * MMA_K * T_SIZE +             // sqk
-                      BLOCK_N * MMA_K * T_SIZE +             // streamed K/V tile
-                      BLOCK_M * BLOCK_N * sizeof(float) +    // ss
-                      BLOCK_M * MMA_DV * sizeof(float) +     // so_tile
-                      BLOCK_M * head_dim_ * sizeof(float) +  // so
-                      BLOCK_M * sizeof(float) +              // s_emax
-                      BLOCK_M * sizeof(float) +              // s_esum
-                      BLOCK_M * BLOCK_N * sizeof(uint16_t);  // sp (half)
-
+  constexpr int BLOCK_M = 64;
   int num_q_blocks = (max_len_extend_ + BLOCK_M - 1) / BLOCK_M;
 
   MTL::Size grid_dims(batch, num_q_heads_, num_q_blocks);
-  MTL::Size group_dims(NSG * 32, 1, 1);
+  MTL::Size group_dims(32, 4, 1);
 
-  compute_encoder.set_threadgroup_memory_length(shmem_size, 0);
+  compute_encoder.set_threadgroup_memory_length(0, 0);
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
