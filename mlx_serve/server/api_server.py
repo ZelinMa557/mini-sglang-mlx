@@ -480,54 +480,7 @@ async def available_models():
     state = get_global_state()
     return ModelList(data=[ModelCard(id=state.config.model_path, root=state.config.model_path)])
 
-
-async def shell_completion(req: OpenAICompletionRequest):
-    state = get_global_state()
-    assert req.messages is not None, "Shell completion only supports chat-completions"
-    prompt = [msg.model_dump() for msg in req.messages]
-
-    # TODO: support more sampling parameters
-    uid = state.new_user()
-    await state.send_one(
-        TokenizeMsg(
-            uid=uid,
-            text=prompt,
-            sampling_params=SamplingParams(
-                ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-            ),
-        )
-    )
-
-    async def _abort():
-        await state.abort_user(uid)
-
-    return StreamingResponse(
-        state.stream_generate(uid),
-        media_type="text/event-stream",
-        background=BackgroundTask(_abort),
-    )
-
-
-async def read_stdin():
-    loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader()
-    protocol = asyncio.StreamReaderProtocol(reader)
-    await loop.connect_read_pipe(lambda: protocol, sys.stdin)
-
-    while True:
-        line = await reader.readline()
-        line = line.decode().rstrip("\n")
-
-
-async def async_input(prompt=""):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: input(prompt))
-
-def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_shell: bool) -> None:
+def run_api_server(config: ServerArgs, start_backend: Callable[[], None]) -> None:
     """
     Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
 
@@ -535,11 +488,9 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
         config: Server configuration (host/port, ZMQ IPC addresses, etc).
         start_backend: Callback that launches the backend worker processes (TP schedulers +
             tokenizer/detokenizer).
-        run_shell: If True, run an interactive terminal shell instead of starting uvicorn.
     """
 
     global _GLOBAL_STATE
-
     host = config.server_host
     port = config.server_port
 
@@ -563,7 +514,4 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
     start_backend()
 
     logger.info(f"API server is ready to serve on {host}:{port}")
-    if not run_shell:
-        uvicorn.run(app, host=host, port=port)
-    else:
-        asyncio.run(shell())
+    uvicorn.run(app, host=host, port=port)

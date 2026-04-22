@@ -138,7 +138,7 @@ def launch_server(run_shell: bool = False) -> None:
         for _ in range(num_tokenizers + 2):
             logger.info(ack_queue.get())
 
-    run_api_server(server_args, start_subprocess, run_shell=run_shell)
+    run_api_server(server_args, start_subprocess)
 
 
 if __name__ == "__main__":

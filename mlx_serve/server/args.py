@@ -172,12 +172,6 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
-        "--shell-mode",
-        action="store_true",
-        help="Run the server in shell mode.",
-    )
-
-    parser.add_argument(
         "--enable-thinking",
         action="store_true",
         help="Enable thinking/reasoning mode in chat template. When enabled, the model may output reasoning content enclosed in <think/> tags.",
@@ -185,12 +179,6 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
-
-    # resolve some arguments
-    run_shell |= kwargs.pop("shell_mode")
-    if run_shell:
-        kwargs["max_running_req"] = 1
-        kwargs["silent_output"] = True
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
