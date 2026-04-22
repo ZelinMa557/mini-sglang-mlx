@@ -18,6 +18,7 @@ class ServerArgs(SchedulerConfig):
     num_tokenizer: int = 0
     silent_output: bool = False
     use_modelscope: bool = False
+    enable_thinking: bool = False
 
     @property
     def share_tokenizer(self) -> bool:
@@ -174,6 +175,12 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",
+    )
+
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Enable thinking/reasoning mode in chat template. When enabled, the model may output reasoning content enclosed in <think/> tags.",
     )
 
     # Parse arguments

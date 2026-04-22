@@ -258,7 +258,11 @@ class FrontendManager:
         while True:
             msg = await self.recv_tokenizer.get()
             for msg in _unwrap_msg(msg):
-                assert msg.uid in self.ack_map
+                if msg.uid not in self.ack_map:
+                    logger.debug(
+                        "Dropping reply for uid=%d (already aborted)", msg.uid
+                    )
+                    continue
                 self.ack_map[msg.uid].append(msg)
                 self.event_map[msg.uid].set()
 
@@ -278,6 +282,8 @@ class FrontendManager:
             await event.wait()
             event.clear()
 
+            if uid not in self.ack_map:
+                break
             pending = self.ack_map[uid]
             self.ack_map[uid] = []
             ack = None
@@ -286,8 +292,8 @@ class FrontendManager:
             if ack and ack.finished:
                 break
 
-        del self.ack_map[uid]
-        del self.event_map[uid]
+        self.ack_map.pop(uid, None)
+        self.event_map.pop(uid, None)
 
     async def stream_generate(self, uid: int):
         async for ack in self.wait_for_ack(uid):
@@ -338,10 +344,11 @@ class FrontendManager:
         await asyncio.sleep(0.1)
         still_pending = uid in self.ack_map
         self.reasoning_parser_map.pop(uid, None)
+        if uid in self.event_map:
+            self.event_map[uid].set()
+            del self.event_map[uid]
         if uid in self.ack_map:
             del self.ack_map[uid]
-        if uid in self.event_map:
-            del self.event_map[uid]
         logger.warning(
             "[Abort] uid=%d  still_pending=%s (client disconnected?)",
             uid, still_pending,

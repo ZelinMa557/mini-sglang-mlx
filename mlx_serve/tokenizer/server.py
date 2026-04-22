@@ -34,6 +34,7 @@ def tokenize_worker(
     frontend_addr: str,
     local_bs: int,
     tokenizer_id: int = -1,
+    enable_thinking: bool = False,
     ack_queue: mp.Queue[str] | None = None,
 ) -> None:
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
@@ -46,7 +47,7 @@ def tokenize_worker(
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer)
+    tokenize_manager = TokenizeManager(tokenizer, enable_thinking=enable_thinking)
     detokenize_manager = DetokenizeManager(tokenizer)
 
     if ack_queue is not None:
