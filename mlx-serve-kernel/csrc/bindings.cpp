@@ -51,18 +51,13 @@ NB_MODULE(_ext, m) {
             "qo_indptr: array, kv_indptr: array, kv_indices: array, "
             "prefix_lens: array, sm_scale: float, max_len_extend: int, "
             "*, stream: Union[None, Stream, Device] = None) -> array"));
-  m.def("gdn_decode_inplace", &mlx_serve::gdn_decode_inplace,
+  m.def("gdn_state_inplace", &mlx_serve::gdn_state_inplace,
         "q"_a, "k"_a, "v"_a, "g"_a, "beta"_a, "state"_a, "slot_ids"_a,
-        nb::kw_only(), "stream"_a = nb::none(),
+        "qo_indptr"_a, "single_token_mode"_a = false, nb::kw_only(),
+        "stream"_a = nb::none(),
         nb::sig(
-            "def gdn_decode_inplace(q: array, k: array, v: array, g: array, "
-            "beta: array, state: array, slot_ids: array, "
-            "*, stream: Union[None, Stream, Device] = None) -> array"));
-  m.def("gdn_prefill_inplace", &mlx_serve::gdn_prefill_inplace,
-        "q"_a, "k"_a, "v"_a, "g"_a, "beta"_a, "state"_a, "slot_ids"_a,
-        "qo_indptr"_a, nb::kw_only(), "stream"_a = nb::none(),
-        nb::sig(
-            "def gdn_prefill_inplace(q: array, k: array, v: array, g: array, "
+            "def gdn_state_inplace(q: array, k: array, v: array, g: array, "
             "beta: array, state: array, slot_ids: array, qo_indptr: array, "
+            "single_token_mode: bool = False, "
             "*, stream: Union[None, Stream, Device] = None) -> array"));
 }

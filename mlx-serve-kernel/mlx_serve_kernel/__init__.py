@@ -1,6 +1,5 @@
 from ._ext import (
-    gdn_decode_inplace,
-    gdn_prefill_inplace,
+    gdn_state_inplace,
     moe_sum_reduce,
     moe_sum_reduce_with_reorder,
     store_kv_cache,

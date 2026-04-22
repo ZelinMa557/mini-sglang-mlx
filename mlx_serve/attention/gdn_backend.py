@@ -1,8 +1,8 @@
 """Backend for GatedDeltaNet linear attention layers.
 
 Mirrors :class:`AttnBackend` but manages recurrent state (conv + temporal)
-instead of paged KV cache.  Separates prefill (variable-length sequential
-recurrence) from decode (batched single-step Metal kernel).
+instead of paged KV cache. Both prefill and decode are dispatched through the
+same fused slot-indexed recurrence kernel.
 
 The backend only handles the recurrence — norm and output projection stay
 in the model layer, mirroring how :class:`AttnBackend` returns raw attention
@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
-from mlx_serve_kernel import gdn_decode_inplace, gdn_prefill_inplace  # pyright: ignore[reportMissingImports]
+from mlx_serve_kernel import gdn_state_inplace  # pyright: ignore[reportMissingImports]
 
 if TYPE_CHECKING:
     from mlx_serve.core import Batch
@@ -46,7 +46,10 @@ class GDNBackend:
             batch.mamba_slot_ids = mx.array(slots, dtype=mx.int32)
             mx.eval(batch.mamba_slot_ids)
 
-        if batch.is_prefill and batch.mamba_prefill_indptr is None:
+        # Reuse the existing field for both phases:
+        # - prefill: ragged cumulative token offsets
+        # - decode:  [0, 1, 2, ..., batch]
+        if batch.mamba_prefill_indptr is None:
             indptr = [0]
             for req in batch.reqs:
                 indptr.append(indptr[-1] + req.extend_len)
@@ -71,51 +74,14 @@ class GDNBackend:
         Prefill: q/k/v/g/beta are ragged [total_tokens, ...].
         Decode:  q/k/v/g/beta are ragged [B, ...] (1 token each).
         """
-        if batch.is_prefill:
-            return self._forward_prefill(
-                q, k, v, g, beta, linear_layer_idx, batch,
-            )
-        else:
-            return self._forward_decode(
-                q, k, v, g, beta, linear_layer_idx, batch,
-            )
-
-    # ── prefill: sequential per-request recurrence ────────────────────
-
-    def _forward_prefill(
-        self,
-        q: mx.array,
-        k: mx.array,
-        v: mx.array,
-        g: mx.array,
-        beta: mx.array,
-        linear_layer_idx: int,
-        batch: "Batch",
-    ) -> mx.array:
         temporal_buf = self.mamba_pool.temporal_state(linear_layer_idx)
         assert batch.mamba_slot_ids is not None
         assert batch.mamba_prefill_indptr is not None
-        return gdn_prefill_inplace(
+
+        return gdn_state_inplace(
             q, k, v, g, beta,
             temporal_buf,
             batch.mamba_slot_ids,
             batch.mamba_prefill_indptr,
-        )
-
-    # ── decode: batched single-step with Metal kernel ─────────────────
-
-    def _forward_decode(
-        self,
-        q: mx.array,
-        k: mx.array,
-        v: mx.array,
-        g: mx.array,
-        beta: mx.array,
-        linear_layer_idx: int,
-        batch: "Batch",
-    ) -> mx.array:
-        assert batch.mamba_slot_ids is not None
-        temporal_buf = self.mamba_pool.temporal_state(linear_layer_idx)
-        return gdn_decode_inplace(
-            q, k, v, g, beta, temporal_buf, batch.mamba_slot_ids,
+            single_token_mode=batch.is_decode,
         )

@@ -1,11 +1,11 @@
 """
 Fused GatedDeltaNet state kernel: correctness and performance checks.
 
-This compares the new fused kernels against the current mlx-serve baseline:
-- Prefill: Python loops over requests/tokens.
-- Decode: gather -> single-step metal kernel -> scatter.
+This compares the fused slot-indexed kernel against the current mlx-serve baseline:
+- Prefill: padded `mlx_lm` gated-delta kernel with mask.
+- Decode: single-step `mlx_lm` gated-delta kernel after slot gather.
 
-The fused kernels read state directly from slot_ids and write it back in-place.
+The fused kernel reads state directly from slot_ids and writes it back in-place.
 Inputs q/k/v/g/beta use bfloat16 while recurrent state uses float32.
 """
 
@@ -17,8 +17,8 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 import numpy as np
-from mlx_lm.models.gated_delta import gated_delta_ops
-from mlx_serve_kernel import gdn_decode_inplace, gdn_prefill_inplace
+from mlx_lm.models.gated_delta import gated_delta_kernel
+from mlx_serve_kernel import gdn_state_inplace
 
 
 @dataclass(frozen=True)
@@ -34,7 +34,16 @@ CONFIGS = [
     GDNConfig(hk=16, hv=48, dk=128, dv=128),
 ]
 
-PREFILL_LENGTHS = [1, 128, 256, 512, 1024]
+PREFILL_CASES = [
+    ("1", [1]),
+    ("128", [128]),
+    ("256", [256]),
+    ("512", [512]),
+    ("1024", [1024]),
+    ("33+65", [33, 65]),
+    ("17+129+257", [17, 129, 257]),
+    ("128x4", [128, 128, 128, 128]),
+]
 DECODE_BATCHES = [1, 2, 4, 8]
 INPUT_SCALE = 0.05
 
@@ -51,6 +60,11 @@ def to_numpy(a: mx.array) -> np.ndarray:
 
 def clone_inputs(data: dict[str, mx.array]) -> dict[str, mx.array]:
     return {key: clone(value) for key, value in data.items()}
+
+
+def lengths_from_indptr(indptr: np.ndarray) -> list[int]:
+    return [int(indptr[i + 1] - indptr[i]) for i in range(len(indptr) - 1)]
+
 
 def numpy_decode_reference(data: dict[str, mx.array]) -> tuple[np.ndarray, np.ndarray]:
     q = to_numpy(data["q"]).astype(np.float32)
@@ -105,6 +119,7 @@ def numpy_prefill_reference(data: dict[str, mx.array]) -> tuple[np.ndarray, np.n
 def build_decode_inputs(config: GDNConfig, batch: int) -> dict[str, mx.array]:
     num_slots = batch
     slot_ids = mx.array(np.arange(0, batch, dtype=np.int32), dtype=mx.int32)
+    qo_indptr = mx.array(np.arange(0, batch + 1, dtype=np.int32), dtype=mx.int32)
     q = (INPUT_SCALE * mx.random.normal((batch, config.hk, config.dk), dtype=mx.float32)).astype(mx.bfloat16)
     k = (INPUT_SCALE * mx.random.normal((batch, config.hk, config.dk), dtype=mx.float32)).astype(mx.bfloat16)
     v = (INPUT_SCALE * mx.random.normal((batch, config.hv, config.dv), dtype=mx.float32)).astype(mx.bfloat16)
@@ -113,7 +128,7 @@ def build_decode_inputs(config: GDNConfig, batch: int) -> dict[str, mx.array]:
     state = INPUT_SCALE * mx.random.normal(
         (num_slots + 1, config.hv, config.dv, config.dk), dtype=mx.float32
     )
-    mx.eval(q, k, v, g, beta, state, slot_ids)
+    mx.eval(q, k, v, g, beta, state, slot_ids, qo_indptr)
     return {
         "q": q,
         "k": k,
@@ -122,6 +137,7 @@ def build_decode_inputs(config: GDNConfig, batch: int) -> dict[str, mx.array]:
         "beta": beta,
         "state": state,
         "slot_ids": slot_ids,
+        "qo_indptr": qo_indptr,
     }
 
 
@@ -178,17 +194,43 @@ def prepare_baseline_decode_inputs(data: dict[str, mx.array]) -> dict[str, mx.ar
 def prepare_baseline_prefill_inputs(data: dict[str, mx.array]) -> dict[str, mx.array]:
     slot_ids_np = to_numpy(data["slot_ids"]).astype(np.int32)
     indptr_np = to_numpy(data["qo_indptr"]).astype(np.int32)
-    assert len(slot_ids_np) == 1, "benchmark prefill baseline expects a single request"
-    slot = int(slot_ids_np[0])
-    start = int(indptr_np[0])
-    end = int(indptr_np[1])
+
+    lengths = lengths_from_indptr(indptr_np)
+    batch = len(lengths)
+    max_len = max(lengths)
+    q_np = to_numpy(data["q"]).astype(np.float32)
+    k_np = to_numpy(data["k"]).astype(np.float32)
+    v_np = to_numpy(data["v"]).astype(np.float32)
+    g_np = to_numpy(data["g"]).astype(np.float32)
+    beta_np = to_numpy(data["beta"]).astype(np.float32)
+    state_np = to_numpy(data["state"]).astype(np.float32)
+
+    q_pad = np.zeros((batch, max_len, *q_np.shape[1:]), dtype=np.float32)
+    k_pad = np.zeros((batch, max_len, *k_np.shape[1:]), dtype=np.float32)
+    v_pad = np.zeros((batch, max_len, *v_np.shape[1:]), dtype=np.float32)
+    g_pad = np.zeros((batch, max_len, g_np.shape[1]), dtype=np.float32)
+    beta_pad = np.zeros((batch, max_len, beta_np.shape[1]), dtype=np.float32)
+    mask = np.zeros((batch, max_len), dtype=np.bool_)
+
+    for b, (_slot, start, end) in enumerate(
+        zip(slot_ids_np.tolist(), indptr_np[:-1].tolist(), indptr_np[1:].tolist())
+    ):
+        length = end - start
+        q_pad[b, :length] = q_np[start:end]
+        k_pad[b, :length] = k_np[start:end]
+        v_pad[b, :length] = v_np[start:end]
+        g_pad[b, :length] = g_np[start:end]
+        beta_pad[b, :length] = beta_np[start:end]
+        mask[b, :length] = True
+
     prepared = {
-        "q": data["q"][start:end][None, :, :, :],
-        "k": data["k"][start:end][None, :, :, :],
-        "v": data["v"][start:end][None, :, :, :],
-        "g": data["g"][start:end][None, :, :],
-        "beta": data["beta"][start:end][None, :, :],
-        "state": data["state"][slot : slot + 1],
+        "q": mx.array(q_pad).astype(mx.bfloat16),
+        "k": mx.array(k_pad).astype(mx.bfloat16),
+        "v": mx.array(v_pad).astype(mx.bfloat16),
+        "g": mx.array(g_pad).astype(mx.bfloat16),
+        "beta": mx.array(beta_pad).astype(mx.bfloat16),
+        "state": mx.array(state_np[slot_ids_np], dtype=mx.float32),
+        "mask": mx.array(mask),
     }
     mx.eval(
         prepared["q"],
@@ -197,6 +239,7 @@ def prepare_baseline_prefill_inputs(data: dict[str, mx.array]) -> dict[str, mx.a
         prepared["g"],
         prepared["beta"],
         prepared["state"],
+        prepared["mask"],
     )
     return prepared
 
@@ -215,15 +258,16 @@ def assert_close(name: str, lhs: mx.array, rhs: mx.array, atol: float = 5e-4) ->
 
 
 def run_fused_decode_bench(data: dict[str, mx.array]) -> None:
-    y = gdn_decode_inplace(
+    y = gdn_state_inplace(
         data["q"], data["k"], data["v"], data["g"], data["beta"],
-        data["state"], data["slot_ids"],
+        data["state"], data["slot_ids"], data["qo_indptr"],
+        single_token_mode=True,
     )
     mx.eval(y)
 
 
 def run_fused_prefill_bench(data: dict[str, mx.array]) -> None:
-    y = gdn_prefill_inplace(
+    y = gdn_state_inplace(
         data["q"], data["k"], data["v"], data["g"], data["beta"],
         data["state"], data["slot_ids"], data["qo_indptr"],
     )
@@ -231,7 +275,7 @@ def run_fused_prefill_bench(data: dict[str, mx.array]) -> None:
 
 
 def run_baseline_decode_bench(prepared: dict[str, mx.array]) -> None:
-    y, new_state = gated_delta_ops(
+    y, new_state = gated_delta_kernel(
         prepared["q"],
         prepared["k"],
         prepared["v"],
@@ -244,13 +288,14 @@ def run_baseline_decode_bench(prepared: dict[str, mx.array]) -> None:
 
 
 def run_baseline_prefill_bench(prepared: dict[str, mx.array]) -> None:
-    y, new_state = gated_delta_ops(
+    y, new_state = gated_delta_kernel(
         prepared["q"],
         prepared["k"],
         prepared["v"],
         prepared["g"],
         prepared["beta"],
         prepared["state"],
+        prepared["mask"],
     )
     mx.eval(y, new_state)
     prepared["state"] = new_state
@@ -270,9 +315,10 @@ def run_correctness() -> None:
         for batch in (1, 4, 8):
             data = build_decode_inputs(config, batch)
             fused_state = clone(data["state"])
-            fused_y = gdn_decode_inplace(
+            fused_y = gdn_state_inplace(
                 data["q"], data["k"], data["v"], data["g"], data["beta"],
-                fused_state, data["slot_ids"],
+                fused_state, data["slot_ids"], data["qo_indptr"],
+                single_token_mode=True,
             )
             ref_y, ref_state = numpy_decode_reference(data)
             assert_close(f"decode batch={batch} output", fused_y, mx.array(ref_y))
@@ -281,7 +327,7 @@ def run_correctness() -> None:
         for lengths in ([1], [7], [128], [33, 65], [17, 129, 257]):
             data = build_prefill_inputs(config, list(lengths))
             fused_state = clone(data["state"])
-            fused_y = gdn_prefill_inplace(
+            fused_y = gdn_state_inplace(
                 data["q"], data["k"], data["v"], data["g"], data["beta"],
                 fused_state, data["slot_ids"], data["qo_indptr"],
             )
@@ -304,12 +350,16 @@ def run_prefill_perf(warmup: int, repeat: int) -> None:
     print("=" * 88)
     print("Prefill performance vs baseline implementation (ms)")
     print("=" * 88)
-    print(f"{'hk':>4} {'hv':>4} {'dk':>5} {'dv':>5} {'len':>8} {'fused':>10} {'baseline':>10} {'speedup':>8}")
+    print(
+        f"{'hk':>4} {'hv':>4} {'dk':>5} {'dv':>5} "
+        f"{'lengths':>14} {'tokens':>8} {'fused':>10} {'baseline':>10} {'speedup':>8}"
+    )
     for config in CONFIGS:
-        for length in PREFILL_LENGTHS:
-            fused_data = build_prefill_inputs(config, [length])
+        for label, lengths in PREFILL_CASES:
+            fused_data = build_prefill_inputs(config, list(lengths))
             base_data = clone_inputs(fused_data)
             baseline_prepared = prepare_baseline_prefill_inputs(base_data)
+            total_tokens = sum(lengths)
 
             fused_ms = bench_once(
                 lambda: run_fused_prefill_bench(fused_data),
@@ -324,7 +374,8 @@ def run_prefill_perf(warmup: int, repeat: int) -> None:
             speedup = base_ms / fused_ms if fused_ms > 0 else float("inf")
             print(
                 f"{config.hk:>4} {config.hv:>4} {config.dk:>5} {config.dv:>5} "
-                f"{length:>8} {fused_ms:>10.3f} {base_ms:>10.3f} {speedup:>7.2f}x"
+                f"{label:>14} {total_tokens:>8} {fused_ms:>10.3f} "
+                f"{base_ms:>10.3f} {speedup:>7.2f}x"
             )
 
 
