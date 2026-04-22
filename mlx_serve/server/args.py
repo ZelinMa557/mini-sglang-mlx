@@ -53,9 +53,9 @@ class ServerArgs(SchedulerConfig):
         return f"tcp://127.0.0.1:{self.server_port + 1}"
 
 
-def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bool]:
+def parse_args(args: List[str]) -> ServerArgs:
     """
-    Parse command line arguments and return an EngineConfig.
+    Parse command line arguments and return an ServerArgs instance.
 
     Args:
         args: Command line arguments (e.g., sys.argv[1:])
@@ -226,4 +226,4 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
-    return result, run_shell
+    return result
