@@ -9,34 +9,19 @@ namespace mx = mlx::core;
 
 namespace mlx_serve {
 
-// Fused single-step GatedDeltaNet recurrence.
+// Fused GatedDeltaNet recurrence with slot-indexed in-place state update.
 //
-// q, k:      (batch, hk, dk) bfloat16
-// v:         (batch, hv, dv) bfloat16
-// g, beta:   (batch, hv) bfloat16
-// state:     (num_slots, hv, dv, dk) float32, updated in-place at slot_ids[b]
-// slot_ids:  (batch,) int32
-// returns y: (batch, hv, dv) bfloat16
-mx::array gdn_decode_inplace(
-    const mx::array& q,
-    const mx::array& k,
-    const mx::array& v,
-    const mx::array& g,
-    const mx::array& beta,
-    const mx::array& state,
-    const mx::array& slot_ids,
-    mx::StreamOrDevice s = {});
-
-// Fused variable-length prefill GatedDeltaNet recurrence.
+// Decode mode: omit qo_indptr and assume one token per request.
+// Prefill mode: provide qo_indptr so each request can own a variable-length span.
 //
-// q, k:       (total_tokens, hk, dk) bfloat16
-// v:          (total_tokens, hv, dv) bfloat16
-// g, beta:    (total_tokens, hv) bfloat16
+// q, k:       (tokens, hk, dk) bfloat16
+// v:          (tokens, hv, dv) bfloat16
+// g, beta:    (tokens, hv) bfloat16
 // state:      (num_slots, hv, dv, dk) float32, updated in-place at slot_ids[b]
 // slot_ids:   (batch,) int32
-// qo_indptr:  (batch + 1,) int32 cumulative token offsets
-// returns y:  (total_tokens, hv, dv) bfloat16
-mx::array gdn_prefill_inplace(
+// qo_indptr:  (batch + 1,) int32 cumulative token offsets, optional
+// returns y:  (tokens, hv, dv) bfloat16
+mx::array gdn_state_inplace(
     const mx::array& q,
     const mx::array& k,
     const mx::array& v,
@@ -45,17 +30,24 @@ mx::array gdn_prefill_inplace(
     const mx::array& state,
     const mx::array& slot_ids,
     const mx::array& qo_indptr,
+    bool single_token_mode = false,
     mx::StreamOrDevice s = {});
 
-class GDNDecodeInplace : public mx::Primitive {
+class GDNStateInplace : public mx::Primitive {
  public:
-  explicit GDNDecodeInplace(
+  explicit GDNStateInplace(
       mx::Stream stream,
       int hk,
       int hv,
       int dk,
-      int dv)
-      : mx::Primitive(stream), hk_(hk), hv_(hv), dk_(dk), dv_(dv) {}
+      int dv,
+      bool single_token_mode)
+      : mx::Primitive(stream),
+        hk_(hk),
+        hv_(hv),
+        dk_(dk),
+        dv_(dv),
+        single_token_mode_(single_token_mode) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -67,7 +59,7 @@ class GDNDecodeInplace : public mx::Primitive {
       std::vector<mx::array>& outputs) override;
 
   const char* name() const override {
-    return "GDNDecodeInplace";
+    return "GDNStateInplace";
   }
 
  private:
@@ -75,36 +67,7 @@ class GDNDecodeInplace : public mx::Primitive {
   int hv_;
   int dk_;
   int dv_;
-};
-
-class GDNPrefillInplace : public mx::Primitive {
- public:
-  explicit GDNPrefillInplace(
-      mx::Stream stream,
-      int hk,
-      int hv,
-      int dk,
-      int dv)
-      : mx::Primitive(stream), hk_(hk), hv_(hv), dk_(dk), dv_(dv) {}
-
-  void eval_cpu(
-      const std::vector<mx::array>& inputs,
-      std::vector<mx::array>& outputs) override {
-    assert(false);
-  }
-  void eval_gpu(
-      const std::vector<mx::array>& inputs,
-      std::vector<mx::array>& outputs) override;
-
-  const char* name() const override {
-    return "GDNPrefillInplace";
-  }
-
- private:
-  int hk_;
-  int hv_;
-  int dk_;
-  int dv_;
+  bool single_token_mode_;
 };
 
 }  // namespace mlx_serve

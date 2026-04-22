@@ -7,13 +7,11 @@ template <typename T, int N_READS = 4>
     const device T* scores,
     device T* out,
     constant uint& topk_num,
-    constant uint& hidden_dim,
     constant uint& y_stride_row,
     constant uint& scores_stride_0,
     constant uint& scores_stride_1,
     constant uint& out_stride_token,
-    uint3 pos [[thread_position_in_grid]],
-    uint3 grid [[threads_per_grid]]) {
+    uint3 pos [[thread_position_in_grid]]) {
 
   const uint token_idx = pos.x;
   const uint base_hidden_idx = pos.y * N_READS;
@@ -53,13 +51,11 @@ template <typename T, int N_READS = 4>
     const device uint32_t* inv_order,
     device T* out,
     constant uint& topk_num,
-    constant uint& hidden_dim,
     constant uint& y_stride_row,
     constant uint& scores_stride_0,
     constant uint& scores_stride_1,
     constant uint& out_stride_token,
-    uint3 pos [[thread_position_in_grid]],
-    uint3 grid [[threads_per_grid]]) {
+    uint3 pos [[thread_position_in_grid]]) {
   const uint out_token_idx = pos.x;
   const uint base_hidden_idx = pos.y * N_READS;
   

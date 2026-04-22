@@ -124,11 +124,10 @@ void MoeSumReduce::eval_gpu(
   compute_encoder.set_input_array(scores, 1);
   compute_encoder.set_output_array(out, 2);
   compute_encoder.set_bytes(topk_num, 3);
-  compute_encoder.set_bytes(hidden_dim, 4);
-  compute_encoder.set_bytes(y_stride_row, 5);
-  compute_encoder.set_bytes(scores_stride_0, 6);
-  compute_encoder.set_bytes(scores_stride_1, 7);
-  compute_encoder.set_bytes(out_stride_token, 8);
+  compute_encoder.set_bytes(y_stride_row, 4);
+  compute_encoder.set_bytes(scores_stride_0, 5);
+  compute_encoder.set_bytes(scores_stride_1, 6);
+  compute_encoder.set_bytes(out_stride_token, 7);
 
   uint32_t dim0 = token_num;
   uint32_t dim1 = hidden_dim / n_reads;
@@ -177,11 +176,10 @@ void MoeSumReduceWithReorder::eval_gpu(
   compute_encoder.set_input_array(inv_order, 2);
   compute_encoder.set_output_array(out, 3);
   compute_encoder.set_bytes(topk_num, 4);
-  compute_encoder.set_bytes(hidden_dim, 5);
-  compute_encoder.set_bytes(y_stride_row, 6);
-  compute_encoder.set_bytes(scores_stride_0, 7);
-  compute_encoder.set_bytes(scores_stride_1, 8);
-  compute_encoder.set_bytes(out_stride_token, 9);
+  compute_encoder.set_bytes(y_stride_row, 5);
+  compute_encoder.set_bytes(scores_stride_0, 6);
+  compute_encoder.set_bytes(scores_stride_1, 7);
+  compute_encoder.set_bytes(out_stride_token, 8);
   
   uint32_t dim0 = token_num;
   uint32_t dim1 = hidden_dim / n_reads;
