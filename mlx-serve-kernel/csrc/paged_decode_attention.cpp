@@ -128,8 +128,7 @@ void PagedDecodeAttention::eval_gpu(
 
   // ---- Stage 1: Partial attention ----
   {
-    int kv_group_num = num_q_heads_ / num_kv_heads_;
-    int block_h = (kv_group_num <= 8) ? 8 : 16;
+    constexpr int block_h = 16;
 
     std::string stage1_name = "paged_decode_attention_stage1_" + tname +
                               "_dk" + std::to_string(head_dim_) + "_dv" +
@@ -151,30 +150,10 @@ void PagedDecodeAttention::eval_gpu(
     compute_encoder.set_bytes(num_kv_heads_, 10);
     compute_encoder.set_bytes(max_kv_splits_, 11);
 
-    // Shared memory size:
-    // - Q block stays resident
-    // - K/V are streamed as 32x32 tensor-op sub-tiles
-    // - KV page indices are cached once per block for reuse by QK/PV
-    constexpr int BLOCK_N = 32;
-    constexpr int NSG = 4;
-    constexpr int MMA_K = 32;
-    constexpr int MMA_DV = 32;
-    constexpr size_t T_SIZE = 2; // sizeof(half) == sizeof(bfloat16_t)
-    size_t shmem_size = block_h * head_dim_ * T_SIZE +         // sq
-                        block_h * MMA_K * T_SIZE +             // sqk
-                        BLOCK_N * MMA_K * T_SIZE +             // streamed K/V tile
-                        BLOCK_N * sizeof(int32_t) +            // s_idx
-                        block_h * BLOCK_N * sizeof(float) +    // ss
-                        block_h * MMA_DV * sizeof(float) +     // so_tile
-                        block_h * head_dim_ * sizeof(float) +  // so
-                        block_h * sizeof(float) +              // s_emax
-                        block_h * sizeof(float) +              // s_esum
-                        block_h * BLOCK_N * sizeof(uint16_t);  // sp (half)
-
     MTL::Size grid_dims(batch, num_kv_heads_, max_kv_splits_);
-    MTL::Size group_dims(NSG * 32, 1, 1);
+    MTL::Size group_dims(32, 1, 1);
 
-    compute_encoder.set_threadgroup_memory_length(shmem_size, 0);
+    compute_encoder.set_threadgroup_memory_length(0, 0);
     compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
   }
 
