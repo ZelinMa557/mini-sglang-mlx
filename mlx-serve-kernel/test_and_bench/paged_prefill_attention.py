@@ -22,6 +22,7 @@ HEAD_CONFIGS = [
     (256, 2, 16),  # (head_dim, kv_heads, q_heads)
     (256, 4, 16),
     (256, 4, 24),
+    (256, 2, 32),
 ]
 
 
@@ -225,6 +226,12 @@ def bench(
     data = build_paged_prefill_inputs(
         q_lens, prefix_lens_list, num_q_heads, num_kv_heads, head_dim, dtype
     )
+    q_len = q_lens[0]
+    q = mx.random.normal((1, num_q_heads, q_len, head_dim), dtype=dtype)
+    k = mx.random.normal((1, num_kv_heads, q_len, head_dim), dtype=dtype)
+    v = mx.random.normal((1, num_kv_heads, q_len, head_dim), dtype=dtype)
+    mx.eval(q, k, v)
+    scale = head_dim ** -0.5
 
     # Warmup + bench our kernel
     for _ in range(warmup):
@@ -236,10 +243,10 @@ def bench(
 
     # Warmup + bench MLX SDPA
     for _ in range(warmup):
-        mx.eval(run_mlx_sdpa(data))
+        mx.eval(mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal"))
     t0 = time.perf_counter()
     for _ in range(repeat):
-        mx.eval(run_mlx_sdpa(data))
+        mx.eval(mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal"))
     sdpa_ms = (time.perf_counter() - t0) / repeat * 1000
 
     return ours_ms, sdpa_ms

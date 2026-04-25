@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Literal, Optional, Tuple
+from typing import Callable, Dict, List, Literal
 
 import uvicorn
 from fastapi import FastAPI
@@ -20,154 +19,16 @@ from mlx_serve.message import (
     TokenizeMsg,
     UserReply,
 )
+from mlx_serve.parser import ReasoningStreamParser, parse_reasoning
 from mlx_serve.utils import ZmqAsyncPullQueue, ZmqAsyncPushQueue, init_logger
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
-from transformers import AutoTokenizer
 
 from .args import ServerArgs
 
 logger = init_logger(__name__, "FrontendAPI")
 
 _GLOBAL_STATE = None
-
-_THINK_START = "<think>"
-_THINK_END = "</think>"
-
-
-def _longest_tag_prefix_suffix(text: str, tags: List[str]) -> int:
-    """Return max length of text suffix that may be a tag prefix."""
-    max_len = 0
-    for tag in tags:
-        max_check = min(len(text), len(tag) - 1)
-        for size in range(max_check, 0, -1):
-            if text.endswith(tag[:size]):
-                max_len = max(max_len, size)
-                break
-    return max_len
-
-
-def _detect_template_injected_think(model_path: str) -> bool:
-    """Detect whether chat template already appends <think> before generation."""
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
-        probe_messages = [{"role": "user", "content": "hi"}]
-        rendered = tokenizer.apply_chat_template(
-            probe_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        if not isinstance(rendered, str):
-            return False
-        # Tolerate trailing spaces/newlines after think tag.
-        return rendered.rstrip().endswith(_THINK_START)
-    except Exception as e:
-        logger.warning("Failed to detect chat template think injection: %s", e)
-        return False
-
-
-def _parse_reasoning_nonstream(
-    text: str, template_injected_think: bool
-) -> Tuple[Optional[str], str]:
-    """Split final output into reasoning_content and content."""
-    if _THINK_START in text:
-        _, _, after_start = text.partition(_THINK_START)
-        if _THINK_END in after_start:
-            reasoning_content, _, content = after_start.partition(_THINK_END)
-            return reasoning_content or None, content
-        # Keep fallback simple: no complete pair means treat as plain content.
-        return None, text
-
-    if _THINK_END in text:
-        before_end, _, content = text.partition(_THINK_END)
-        if template_injected_think:
-            return before_end or None, content
-        # For non-template case, this still commonly indicates reasoning-first output.
-        return before_end or None, content
-
-    return None, text
-
-
-@dataclass
-class ReasoningStreamParser:
-    template_injected_think: bool
-    state: str = field(init=False)
-    pending: str = ""
-
-    def __post_init__(self) -> None:
-        self.state = "reasoning" if self.template_injected_think else "content"
-
-    def _flush_content_safe(self) -> str:
-        keep = _longest_tag_prefix_suffix(self.pending, [_THINK_START, _THINK_END])
-        emit_len = len(self.pending) - keep
-        if emit_len <= 0:
-            return ""
-        out = self.pending[:emit_len]
-        self.pending = self.pending[emit_len:]
-        return out
-
-    def _flush_reasoning_safe(self) -> str:
-        keep = _longest_tag_prefix_suffix(self.pending, [_THINK_END, _THINK_START])
-        emit_len = len(self.pending) - keep
-        if emit_len <= 0:
-            return ""
-        out = self.pending[:emit_len]
-        self.pending = self.pending[emit_len:]
-        return out
-
-    def feed(self, text: str, *, finished: bool) -> Tuple[Optional[str], Optional[str]]:
-        self.pending += text
-        reasoning_delta = ""
-        content_delta = ""
-
-        while True:
-            if self.state == "content":
-                start_idx = self.pending.find(_THINK_START)
-                end_idx = self.pending.find(_THINK_END)
-
-                if start_idx != -1 and (end_idx == -1 or start_idx < end_idx):
-                    content_delta += self.pending[:start_idx]
-                    self.pending = self.pending[start_idx + len(_THINK_START) :]
-                    self.state = "reasoning"
-                    continue
-
-                if end_idx != -1:
-                    # Support template-injected <think>: output may only emit </think>.
-                    reasoning_delta += self.pending[:end_idx]
-                    self.pending = self.pending[end_idx + len(_THINK_END) :]
-                    self.state = "content"
-                    continue
-
-                if finished:
-                    content_delta += self.pending
-                    self.pending = ""
-                else:
-                    content_delta += self._flush_content_safe()
-                break
-
-            # reasoning state
-            end_idx = self.pending.find(_THINK_END)
-            if end_idx != -1:
-                reasoning_delta += self.pending[:end_idx]
-                self.pending = self.pending[end_idx + len(_THINK_END) :]
-                self.state = "content"
-                continue
-
-            start_idx = self.pending.find(_THINK_START)
-            if start_idx != -1:
-                # Drop nested/repeated start token if it appears.
-                reasoning_delta += self.pending[:start_idx]
-                self.pending = self.pending[start_idx + len(_THINK_START) :]
-                continue
-
-            if finished:
-                reasoning_delta += self.pending
-                self.pending = ""
-            else:
-                reasoning_delta += self._flush_reasoning_safe()
-            break
-
-        return reasoning_delta or None, content_delta or None
 
 
 def get_global_state() -> FrontendManager:
@@ -245,7 +106,7 @@ class FrontendManager:
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
     reasoning_parser_map: Dict[int, ReasoningStreamParser] = field(default_factory=dict)
-    template_injected_think: bool = False
+    enable_thinking: bool = False
 
     def new_user(self) -> int:
         uid = self.uid_counter
@@ -258,7 +119,11 @@ class FrontendManager:
         while True:
             msg = await self.recv_tokenizer.get()
             for msg in _unwrap_msg(msg):
-                assert msg.uid in self.ack_map
+                if msg.uid not in self.ack_map:
+                    logger.debug(
+                        "Dropping reply for uid=%d (already aborted)", msg.uid
+                    )
+                    continue
                 self.ack_map[msg.uid].append(msg)
                 self.event_map[msg.uid].set()
 
@@ -278,6 +143,8 @@ class FrontendManager:
             await event.wait()
             event.clear()
 
+            if uid not in self.ack_map:
+                break
             pending = self.ack_map[uid]
             self.ack_map[uid] = []
             ack = None
@@ -286,8 +153,8 @@ class FrontendManager:
             if ack and ack.finished:
                 break
 
-        del self.ack_map[uid]
-        del self.event_map[uid]
+        self.ack_map.pop(uid, None)
+        self.event_map.pop(uid, None)
 
     async def stream_generate(self, uid: int):
         async for ack in self.wait_for_ack(uid):
@@ -298,20 +165,23 @@ class FrontendManager:
         logger.debug("Finished streaming response for user %s", uid)
 
     async def stream_chat_completions(self, uid: int):
-        parser = self.reasoning_parser_map[uid]
+        parser = self.reasoning_parser_map.get(uid)
         first_chunk = True
         async for ack in self.wait_for_ack(uid):
-            reasoning_delta, content_delta = parser.feed(
-                ack.incremental_output, finished=ack.finished
-            )
             delta = {}
             if first_chunk:
                 delta["role"] = "assistant"
                 first_chunk = False
-            if reasoning_delta is not None:
-                delta["reasoning_content"] = reasoning_delta
-            if content_delta is not None:
-                delta["content"] = content_delta
+            if parser is not None:
+                reasoning_delta, content_delta = parser.feed(
+                    ack.incremental_output, finished=ack.finished
+                )
+                if reasoning_delta is not None:
+                    delta["reasoning_content"] = reasoning_delta
+                if content_delta is not None:
+                    delta["content"] = content_delta
+            else:
+                delta["content"] = ack.incremental_output
 
             chunk = {
                 "id": f"cmpl-{uid}",
@@ -338,10 +208,11 @@ class FrontendManager:
         await asyncio.sleep(0.1)
         still_pending = uid in self.ack_map
         self.reasoning_parser_map.pop(uid, None)
+        if uid in self.event_map:
+            self.event_map[uid].set()
+            del self.event_map[uid]
         if uid in self.ack_map:
             del self.ack_map[uid]
-        if uid in self.event_map:
-            del self.event_map[uid]
         logger.warning(
             "[Abort] uid=%d  still_pending=%s (client disconnected?)",
             uid, still_pending,
@@ -405,10 +276,8 @@ async def v1_completions(req: OpenAICompletionRequest):
         prompt = req.prompt
 
     uid = state.new_user()
-    template_injected_think = state.template_injected_think and (req.messages is not None)
-    state.reasoning_parser_map[uid] = ReasoningStreamParser(
-        template_injected_think=template_injected_think
-    )
+    if state.enable_thinking and req.messages is not None:
+        state.reasoning_parser_map[uid] = ReasoningStreamParser()
     msg_summary = ""
     if req.messages:
         msg_summary = " | ".join(f"{m.role}: {m.content[:80]}" for m in req.messages)
@@ -439,9 +308,10 @@ async def v1_completions(req: OpenAICompletionRequest):
             if ack.finished:
                 break
         state.reasoning_parser_map.pop(uid, None)
-        reasoning_content, content = _parse_reasoning_nonstream(
-            full_text, template_injected_think=template_injected_think
-        )
+        if state.enable_thinking:
+            reasoning_content, content = parse_reasoning(full_text)
+        else:
+            reasoning_content, content = None, full_text
         return {
             "id": f"cmpl-{uid}",
             "object": "chat.completion",
@@ -473,54 +343,7 @@ async def available_models():
     state = get_global_state()
     return ModelList(data=[ModelCard(id=state.config.model_path, root=state.config.model_path)])
 
-
-async def shell_completion(req: OpenAICompletionRequest):
-    state = get_global_state()
-    assert req.messages is not None, "Shell completion only supports chat-completions"
-    prompt = [msg.model_dump() for msg in req.messages]
-
-    # TODO: support more sampling parameters
-    uid = state.new_user()
-    await state.send_one(
-        TokenizeMsg(
-            uid=uid,
-            text=prompt,
-            sampling_params=SamplingParams(
-                ignore_eos=req.ignore_eos,
-                max_tokens=req.max_tokens,
-                temperature=req.temperature,
-                top_k=req.top_k,
-                top_p=req.top_p,
-            ),
-        )
-    )
-
-    async def _abort():
-        await state.abort_user(uid)
-
-    return StreamingResponse(
-        state.stream_generate(uid),
-        media_type="text/event-stream",
-        background=BackgroundTask(_abort),
-    )
-
-
-async def read_stdin():
-    loop = asyncio.get_running_loop()
-    reader = asyncio.StreamReader()
-    protocol = asyncio.StreamReaderProtocol(reader)
-    await loop.connect_read_pipe(lambda: protocol, sys.stdin)
-
-    while True:
-        line = await reader.readline()
-        line = line.decode().rstrip("\n")
-
-
-async def async_input(prompt=""):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: input(prompt))
-
-def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_shell: bool) -> None:
+def run_api_server(config: ServerArgs, start_backend: Callable[[], None]) -> None:
     """
     Run the frontend API server (FastAPI + uvicorn) and wire it to the tokenizer process via ZMQ.
 
@@ -528,11 +351,9 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
         config: Server configuration (host/port, ZMQ IPC addresses, etc).
         start_backend: Callback that launches the backend worker processes (TP schedulers +
             tokenizer/detokenizer).
-        run_shell: If True, run an interactive terminal shell instead of starting uvicorn.
     """
 
     global _GLOBAL_STATE
-
     host = config.server_host
     port = config.server_port
 
@@ -549,14 +370,11 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
             create=config.frontend_create_tokenizer_link,
             encoder=BaseTokenizerMsg.encoder,
         ),
-        template_injected_think=_detect_template_injected_think(config.model_path),
+        enable_thinking=config.enable_thinking,
     )
 
     # start the backend here
     start_backend()
 
     logger.info(f"API server is ready to serve on {host}:{port}")
-    if not run_shell:
-        uvicorn.run(app, host=host, port=port)
-    else:
-        asyncio.run(shell())
+    uvicorn.run(app, host=host, port=port)

@@ -18,6 +18,7 @@ class ServerArgs(SchedulerConfig):
     num_tokenizer: int = 0
     silent_output: bool = False
     use_modelscope: bool = False
+    enable_thinking: bool = False
 
     @property
     def share_tokenizer(self) -> bool:
@@ -52,9 +53,9 @@ class ServerArgs(SchedulerConfig):
         return f"tcp://127.0.0.1:{self.server_port + 1}"
 
 
-def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bool]:
+def parse_args(args: List[str]) -> ServerArgs:
     """
-    Parse command line arguments and return an EngineConfig.
+    Parse command line arguments and return an ServerArgs instance.
 
     Args:
         args: Command line arguments (e.g., sys.argv[1:])
@@ -171,19 +172,13 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
-        "--shell-mode",
+        "--enable-thinking",
         action="store_true",
-        help="Run the server in shell mode.",
+        help="Enable thinking/reasoning mode in chat template. When enabled, the model may output reasoning content enclosed in <think/> tags.",
     )
 
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
-
-    # resolve some arguments
-    run_shell |= kwargs.pop("shell_mode")
-    if run_shell:
-        kwargs["max_running_req"] = 1
-        kwargs["silent_output"] = True
 
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
@@ -231,4 +226,4 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
-    return result, run_shell
+    return result

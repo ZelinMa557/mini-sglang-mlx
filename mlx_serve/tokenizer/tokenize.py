@@ -13,8 +13,9 @@ logger = init_logger(__name__)
 
 
 class TokenizeManager:
-    def __init__(self, tokenizer: LlamaTokenizer) -> None:
+    def __init__(self, tokenizer: LlamaTokenizer, enable_thinking: bool = False) -> None:
         self.tokenizer = tokenizer
+        self.enable_thinking = enable_thinking
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[mx.array]:
         results: List[mx.array] = []
@@ -24,6 +25,7 @@ class TokenizeManager:
                     msg.text,
                     tokenize=False,
                     add_generation_prompt=True,
+                    enable_thinking=self.enable_thinking,
                 )
                 assert isinstance(prompt, str)
             else:
