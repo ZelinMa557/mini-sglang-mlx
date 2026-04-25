@@ -22,6 +22,7 @@ HEAD_CONFIGS = [
     (256, 2, 16),  # (head_dim, kv_heads, q_heads)
     (256, 4, 16),
     (256, 4, 24),
+    (256, 2, 32),
 ]
 
 

@@ -19,6 +19,7 @@ HEAD_CONFIGS = [
     (256, 2, 16),  # (head_dim, kv_heads, q_heads)
     (256, 4, 16),
     (256, 4, 24),
+    (256, 2, 32)
 ]
 
 
@@ -213,7 +214,11 @@ def bench(
     repeat: int = 100,
 ):
     data = build_paged_decode_inputs(kv_lens, num_q_heads, num_kv_heads, head_dim, dtype)
-
+    q = mx.random.normal((1, num_q_heads, 1, head_dim), dtype=dtype)
+    k = mx.random.normal((1, num_kv_heads, kv_lens[0], head_dim), dtype=dtype)
+    v = mx.random.normal((1, num_kv_heads, kv_lens[0], head_dim), dtype=dtype)
+    mx.eval(q, k, v)
+    scale = head_dim ** -0.5
     # Warmup + bench our kernel
     for _ in range(warmup):
         mx.eval(run_our_kernel(data))
@@ -224,10 +229,10 @@ def bench(
 
     # Warmup + bench MLX SDPA
     for _ in range(warmup):
-        mx.eval(run_mlx_sdpa(data))
+        mx.eval(mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal"))
     t0 = time.perf_counter()
     for _ in range(repeat):
-        mx.eval(run_mlx_sdpa(data))
+        mx.eval(mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal"))
     sdpa_ms = (time.perf_counter() - t0) / repeat * 1000
 
     return ours_ms, sdpa_ms
@@ -246,6 +251,11 @@ def bench_uniform_batch(
     data = build_paged_decode_inputs(
         [kv_len] * batch_size, num_q_heads, num_kv_heads, head_dim, dtype
     )
+    q = mx.random.normal((batch_size, num_q_heads, 1, head_dim), dtype=dtype)
+    k = mx.random.normal((batch_size, num_kv_heads, kv_len, head_dim), dtype=dtype)
+    v = mx.random.normal((batch_size, num_kv_heads, kv_len, head_dim), dtype=dtype)
+    mx.eval(q, k, v)
+    scale = head_dim ** -0.5
 
     for _ in range(warmup):
         mx.eval(run_our_kernel(data))
@@ -255,10 +265,10 @@ def bench_uniform_batch(
     ours_ms = (time.perf_counter() - t0) / repeat * 1000
 
     for _ in range(warmup):
-        mx.eval(run_mlx_sdpa_uniform_batch(data))
+        mx.eval(mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal"))
     t0 = time.perf_counter()
     for _ in range(repeat):
-        mx.eval(run_mlx_sdpa_uniform_batch(data))
+        mx.eval(mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal"))
     sdpa_ms = (time.perf_counter() - t0) / repeat * 1000
 
     return ours_ms, sdpa_ms
