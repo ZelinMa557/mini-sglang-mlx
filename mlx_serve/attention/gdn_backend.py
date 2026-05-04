@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
-from mlx_serve_kernel import gdn_state_inplace  # pyright: ignore[reportMissingImports]
+from mlx_serve_kernel import gdn_state_inplace, gdn_state_verify  # pyright: ignore[reportMissingImports]
 
 if TYPE_CHECKING:
     from mlx_serve.core import Batch
@@ -84,4 +84,33 @@ class GDNBackend:
             batch.mamba_slot_ids,
             batch.mamba_prefill_indptr,
             single_token_mode=batch.is_decode,
+        )
+
+    def forward_verify(
+        self,
+        q: mx.array,
+        k: mx.array,
+        v: mx.array,
+        g: mx.array,
+        beta: mx.array,
+        linear_layer_idx: int,
+        batch: "Batch",
+    ) -> mx.array:
+        """Run GDN recurrence for target-verify (MTP) phase.
+
+        Each sequence processes ``num_draft`` tokens sequentially.
+        The initial state is read from ``batch.mamba_slot_ids[b, 0]``;
+        after token *j* the updated state is written to
+        ``batch.mamba_slot_ids[b, j]`` so the caller can rollback to
+        the last accepted token after verification.
+
+        All sequences must have the same ``num_draft``.
+        """
+        temporal_buf = self.mamba_pool.temporal_state(linear_layer_idx)
+        assert batch.mamba_slot_ids is not None
+
+        return gdn_state_verify(
+            q, k, v, g, beta,
+            temporal_buf,
+            batch.mamba_slot_ids,
         )

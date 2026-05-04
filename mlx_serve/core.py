@@ -70,7 +70,7 @@ class Req:
 @dataclass
 class Batch:
     reqs: List[Req]
-    phase: Literal["prefill", "decode"]
+    phase: Literal["prefill", "decode", "target_verify"]
     # these fields should be set by scheduler
     input_ids: mx.array = field(init=False)
     out_loc: mx.array = field(init=False)
@@ -87,6 +87,10 @@ class Batch:
     @property
     def is_decode(self) -> bool:
         return self.phase == "decode"
+
+    @property
+    def is_target_verify(self) -> bool:
+        return self.phase == "target_verify"
 
     @property
     def size(self) -> int:

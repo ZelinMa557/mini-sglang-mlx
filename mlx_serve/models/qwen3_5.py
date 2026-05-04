@@ -202,6 +202,42 @@ class GatedDeltaNet(nn.Module):
         conv_out = self.conv1d(conv_input)  # [B, 1, conv_dim]
         return nn.silu(conv_out.squeeze(axis=1))
 
+    def _apply_conv_verify(
+        self, qkv: mx.array, batch: "Batch", mamba_pool: "MambaStatePool",
+    ) -> mx.array:
+        """Target-verify: batched depthwise conv1d with per-step state checkpoint.
+
+        All sequences must have the same ``num_draft`` tokens.
+        The initial conv state is read from ``slot_ids[:, 0]`` (base slots);
+        after token *j* the updated conv state is written to checkpoint slots
+        ``slot_ids[:, j]`` in a batched manner.
+        """
+        assert batch.mamba_slot_ids is not None
+        conv_buf = mamba_pool.conv_state(self.linear_layer_idx)
+        state_len = self.conv_kernel_size - 1
+
+        slot_ids = batch.mamba_slot_ids  # [batch_size, num_draft]
+        batch_size, num_draft = slot_ids.shape
+
+        # 1. Gather base conv states: [batch_size, K-1, conv_dim]
+        base_slots = slot_ids[:, 0]
+        conv_state = conv_buf[base_slots]
+
+        # 2. Reshape qkv to [batch_size, num_draft, conv_dim]
+        seg = qkv.reshape(batch_size, num_draft, self.conv_dim)
+
+        # 3. Batched conv1d: [batch_size, K-1+num_draft, conv_dim] -> [batch_size, num_draft, conv_dim]
+        conv_input = mx.concatenate([conv_state, seg], axis=1)
+        conv_out = self.conv1d(conv_input)
+        conv_out = conv_out.reshape(batch_size * num_draft, self.conv_dim)
+
+        # 4. Save per-step conv states in a batch-aware loop over draft steps.
+        for j in range(num_draft):
+            ck_slots = slot_ids[:, j]
+            conv_buf[ck_slots] = conv_input[:, j + 1 : j + 1 + state_len, :]
+
+        return nn.silu(conv_out)
+
     def __call__(self, x: mx.array) -> mx.array:
         ctx = get_global_ctx()
         batch = ctx.batch
@@ -217,6 +253,8 @@ class GatedDeltaNet(nn.Module):
         a = self.in_proj_a(x)                                  # [L, Hv]
         if batch.is_decode:
             conv_out = self._apply_conv_decode(mixed_qkv, batch, mamba_pool)
+        elif batch.is_target_verify:
+            conv_out = self._apply_conv_verify(mixed_qkv, batch, mamba_pool)
         else:
             conv_out = self._apply_conv_prefill(mixed_qkv, batch, mamba_pool)
         q = conv_out[:, : self.key_dim].reshape(L, self.num_k_heads, self.head_k_dim)
@@ -230,10 +268,16 @@ class GatedDeltaNet(nn.Module):
         beta = mx.sigmoid(b)
         g = compute_gate(self.A_log, a, self.dt_bias)
 
-        y = gdn_backend.forward(
-            q, k, v, g, beta,
-            self.linear_layer_idx, batch,
-        )
+        if batch.is_target_verify:
+            y = gdn_backend.forward_verify(
+                q, k, v, g, beta,
+                self.linear_layer_idx, batch,
+            )
+        else:
+            y = gdn_backend.forward(
+                q, k, v, g, beta,
+                self.linear_layer_idx, batch,
+            )
         y = self.norm(y, z)
         return self.out_proj(y.reshape(L, -1))
 

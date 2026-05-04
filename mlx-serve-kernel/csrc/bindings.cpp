@@ -7,6 +7,7 @@
 #include "store_kv_cache.h"
 #include "fast_compare_key.h"
 #include "gdn_state.h"
+#include "gdn_verify.h"
 #include "paged_decode_attention.h"
 #include "paged_prefill_attention.h"
 namespace nb = nanobind;
@@ -59,5 +60,12 @@ NB_MODULE(_ext, m) {
             "def gdn_state_inplace(q: array, k: array, v: array, g: array, "
             "beta: array, state: array, slot_ids: array, qo_indptr: array, "
             "single_token_mode: bool = False, "
+            "*, stream: Union[None, Stream, Device] = None) -> array"));
+  m.def("gdn_state_verify", &mlx_serve::gdn_state_verify,
+        "q"_a, "k"_a, "v"_a, "g"_a, "beta"_a, "state"_a, "slot_ids"_a,
+        nb::kw_only(), "stream"_a = nb::none(),
+        nb::sig(
+            "def gdn_state_verify(q: array, k: array, v: array, g: array, "
+            "beta: array, state: array, slot_ids: array, "
             "*, stream: Union[None, Stream, Device] = None) -> array"));
 }
