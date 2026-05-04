@@ -177,6 +177,14 @@ def parse_args(args: List[str]) -> ServerArgs:
         help="Enable thinking/reasoning mode in chat template. When enabled, the model may output reasoning content enclosed in <think/> tags.",
     )
 
+    parser.add_argument(
+        "--mtp-model-path",
+        type=str,
+        default=None,
+        help="Path to the MTP draft model weights (.safetensors file or directory). "
+             "When set, enables multi-token prediction speculative decoding.",
+    )
+
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 
