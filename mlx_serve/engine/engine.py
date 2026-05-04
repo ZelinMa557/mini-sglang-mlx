@@ -9,6 +9,7 @@ from mlx_serve.attention import AttnBackend
 from mlx_serve.core import Batch, Context, Req, set_global_ctx
 from mlx_serve.kvcache.mha_pool import MHAKVCache
 from mlx_serve.models import create_model
+from mlx_serve.models.qwen3_5_mtp import load_qwen3_5_mtp_draft_model
 from mlx_serve.utils import init_logger
 
 from .config import EngineConfig
@@ -107,6 +108,14 @@ class Engine:
         )
         set_global_ctx(self.ctx)
         self.sampler = Sampler(self.model_meta.vocab_size)
+
+        self.draft_model = None
+        if config.mtp_model_path is not None:
+            logger.info("Loading MTP draft model from %s", config.mtp_model_path)
+            self.draft_model, _ = load_qwen3_5_mtp_draft_model(
+                config.mtp_model_path, self.model
+            )
+            logger.info("MTP draft model loaded and shared embed/lm_head.")
 
         self.dummy_req = Req(
             input_ids=mx.array([0], dtype=mx.int32),

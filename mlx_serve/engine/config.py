@@ -20,6 +20,7 @@ class EngineConfig:
     page_size: int = 1
     kv_cache_gb: float | None = None
     max_seq_len_override: int | None = None
+    mtp_model_path: str | None = None
 
     @cached_property
     def hf_config(self):
