@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Literal
+from enum import Enum
+from typing import TYPE_CHECKING, List
 
 import mlx.core as mx
 
@@ -10,6 +11,12 @@ if TYPE_CHECKING:
     from mlx_serve.attention import AttnBackend, BaseAttnMetadata, GDNBackend
     from mlx_serve.kvcache import BaseCacheHandle
     from mlx_serve.kvcache.mamba_pool import MambaStatePool
+
+
+class BatchPhase(str, Enum):
+    PREFILL = "prefill"
+    DECODE = "decode"
+    TARGET_VERIFY = "target_verify"
 
 
 @dataclass
@@ -70,7 +77,7 @@ class Req:
 @dataclass
 class Batch:
     reqs: List[Req]
-    phase: Literal["prefill", "decode", "target_verify"]
+    phase: BatchPhase
     # these fields should be set by scheduler
     input_ids: mx.array = field(init=False)
     out_loc: mx.array = field(init=False)
@@ -82,15 +89,15 @@ class Batch:
 
     @property
     def is_prefill(self) -> bool:
-        return self.phase == "prefill"
+        return self.phase == BatchPhase.PREFILL
 
     @property
     def is_decode(self) -> bool:
-        return self.phase == "decode"
+        return self.phase == BatchPhase.DECODE
 
     @property
     def is_target_verify(self) -> bool:
-        return self.phase == "target_verify"
+        return self.phase == BatchPhase.TARGET_VERIFY
 
     @property
     def size(self) -> int:

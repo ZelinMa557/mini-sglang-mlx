@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
 import mlx.core as mx
-from mlx_serve.core import Batch, Req
+from mlx_serve.core import Batch, BatchPhase, Req
 from mlx_serve.utils import init_logger
 
 from .utils import PendingReq
@@ -158,7 +158,7 @@ class PrefillManager:
         if len(reqs) == 0:
             return None
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]
-        return Batch(reqs=reqs, phase="prefill")
+        return Batch(reqs=reqs, phase=BatchPhase.PREFILL)
 
     @property
     def runnable(self) -> bool:

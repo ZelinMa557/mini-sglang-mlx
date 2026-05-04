@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterable, Set
 
-from mlx_serve.core import Batch, Req
+from mlx_serve.core import Batch, BatchPhase, Req
 
 
 @dataclass
@@ -23,7 +23,7 @@ class DecodeManager:
     def schedule_next_batch(self) -> Batch | None:
         if not self.runnable:
             return None
-        return Batch(reqs=list(self.running_reqs), phase="decode")
+        return Batch(reqs=list(self.running_reqs), phase=BatchPhase.DECODE)
 
     @property
     def runnable(self) -> bool:
