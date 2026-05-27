@@ -360,13 +360,23 @@ class Model(nn.Module):
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self) -> mx.array:
-        out = self.model(get_global_ctx().batch.input_ids)
+    def __call__(self, return_hidden: bool = False):
+        """Run the target model on the active batch's input_ids.
+
+        Args:
+            return_hidden: When ``True``, return a ``(hidden, logits)``
+                tuple where ``hidden`` is the post-norm hidden state
+                fed into ``lm_head``.  Needed by MTP/EAGLE engines to
+                feed target hidden states into the draft model.
+        """
+        hidden = self.model(get_global_ctx().batch.input_ids)
         if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
+            logits = self.model.embed_tokens.as_linear(hidden)
         else:
-            out = self.lm_head(out)
-        return out
+            logits = self.lm_head(hidden)
+        if return_hidden:
+            return hidden, logits
+        return logits
 
     @property
     def is_hybrid(self) -> bool:

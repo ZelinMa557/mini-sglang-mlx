@@ -43,6 +43,20 @@ class Req:
     cache_handle: BaseCacheHandle
     mamba_slot: int | None = None  # slot in MambaStatePool for hybrid models
 
+    # ── MTP / EAGLE-style speculative decoding state ──────────────────
+    # ``pending_token`` is the next-token that has been sampled but is
+    # NOT yet committed to the target's KV cache; it sits at
+    # ``input_ids[cached_len]`` and will be re-fed during the next
+    # iter's target verify step.
+    # ``pending_draft_token`` / ``pending_draft_hidden`` carry the FIRST
+    # draft prediction for the upcoming iter (produced either by the
+    # draft prefill or by the previous iter's "bonus" draft step) and
+    # the draft model's hidden state at that draft position (used as
+    # ``target_hidden_states`` proxy for the first regular draft step).
+    pending_token: mx.array | None = None  # shape [1]
+    pending_draft_token: mx.array | None = None  # shape [1]
+    pending_draft_hidden: mx.array | None = None  # shape [hidden_size]
+
     def __post_init__(self) -> None:
         self.device_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
@@ -59,6 +73,17 @@ class Req:
     def complete_one(self) -> None:
         self.cached_len = self.device_len
         self.device_len += 1
+
+    def complete_many(self, n: int) -> None:
+        """Same semantics as :meth:`complete_one` but commits ``n`` tokens.
+
+        After the call, ``cached_len`` is bumped by ``n`` and ``device_len``
+        is set to ``cached_len + 1`` so that exactly one pending/placeholder
+        slot is reserved for the next iter. Used by speculative decoders
+        where a single forward pass commits a variable number of tokens.
+        """
+        self.cached_len += n
+        self.device_len = self.cached_len + 1
 
     def append_host(self, next_token: mx.array) -> None:
         self.input_ids = mx.concatenate([self.input_ids, next_token])
@@ -143,3 +168,20 @@ def set_global_ctx(ctx: Context):
 def get_global_ctx() -> Context:
     assert _GLOBAL_CTX is not None, "Global context is not set"
     return _GLOBAL_CTX
+
+
+@contextmanager
+def use_ctx(ctx: Context):
+    """Temporarily swap the process-global context.
+
+    Used by speculative-decoding engines that own a second ``Context``
+    for the draft model (different ``AttnBackend`` / KV cache) but share
+    the target model's layers (which read ``get_global_ctx()``).
+    """
+    global _GLOBAL_CTX
+    old = _GLOBAL_CTX
+    _GLOBAL_CTX = ctx
+    try:
+        yield
+    finally:
+        _GLOBAL_CTX = old

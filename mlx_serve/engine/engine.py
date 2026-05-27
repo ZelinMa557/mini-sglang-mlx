@@ -133,7 +133,14 @@ class Engine:
 
         conv_shapes, temporal_shapes = self.model.get_linear_state_shapes()
         num_linear_layers = len(conv_shapes)
-        num_slots = config.max_running_req * 2
+        # 2x running reqs is enough for normal serving (main slot + radix
+        # cache buffer).  MTP needs additional K checkpoint slots per req
+        # during the verify path (slot_ids[:, 1..K] in GDN forward_verify);
+        # bump the multiplier so we never block on checkpoint allocation.
+        multiplier = 2
+        if config.mtp_model_path is not None:
+            multiplier = config.num_mtp_step + 2
+        num_slots = config.max_running_req * multiplier
         pool_config = MambaStateConfig(
             num_slots=num_slots,
             num_layers=num_linear_layers,

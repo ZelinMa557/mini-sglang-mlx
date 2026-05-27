@@ -48,7 +48,9 @@ class Qwen3_5_MTPDraftModel(nn.Module):
 
         # One full-attention decoder layer (full_attention_interval=1 guarantees
         # layer_idx=0 is an Attention layer, not GatedDeltaNet).
-        self.layers = [decoder_layer_cls(args=args, layer_idx=0)]
+        # Pass attn_layer_idx=0 explicitly so the Attention sub-module's
+        # ``layer_id`` matches the draft KV cache's single-layer indexing.
+        self.layers = [decoder_layer_cls(args=args, layer_idx=0, attn_layer_idx=0)]
 
         self.norm = nn.RMSNorm(dim, eps=args.rms_norm_eps)
 
@@ -56,16 +58,26 @@ class Qwen3_5_MTPDraftModel(nn.Module):
         self.embed_tokens: nn.Embedding | None = None
         self.lm_head: nn.Linear | None = None
 
-    def __call__(self, input_ids: mx.array, target_hidden_states: mx.array) -> mx.array:
+    def __call__(
+        self,
+        input_ids: mx.array,
+        target_hidden_states: mx.array,
+        return_hidden: bool = False,
+    ):
         """Forward one draft step.
 
         Args:
             input_ids: Token IDs for the current position ``[L]``.
             target_hidden_states: Hidden states from the target model at the
                 same position ``[L, hidden_size]``.
+            return_hidden: When ``True``, also return the draft's post-norm
+                hidden states ``[L, hidden_size]``.  These act as the
+                ``target_hidden_states`` proxy for the *next* draft step
+                in EAGLE-style multi-step speculative decoding.
 
         Returns:
-            Logits ``[L, vocab_size]``.
+            ``logits`` ``[L, vocab_size]`` or ``(hidden, logits)`` when
+            ``return_hidden=True``.
         """
         assert self.embed_tokens is not None
         input_embeds = self.embed_tokens(input_ids)
@@ -82,10 +94,13 @@ class Qwen3_5_MTPDraftModel(nn.Module):
 
         if self.args.tie_word_embeddings:
             assert self.embed_tokens is not None
-            return self.embed_tokens.as_linear(hidden_states)
+            logits = self.embed_tokens.as_linear(hidden_states)
         else:
             assert self.lm_head is not None
-            return self.lm_head(hidden_states)
+            logits = self.lm_head(hidden_states)
+        if return_hidden:
+            return hidden_states, logits
+        return logits
 
     # ------------------------------------------------------------------ #
     # Weight loading helpers

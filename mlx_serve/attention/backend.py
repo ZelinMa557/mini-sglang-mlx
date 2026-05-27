@@ -116,23 +116,51 @@ class AttnBackend:
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
         if batch.is_prefill:
-            batch.attn_metadata = self._build_prefill_metadata(reqs)
+            batch.attn_metadata = self.build_prefill_metadata(reqs)
         else:
-            batch.attn_metadata = self._build_decode_metadata(reqs)
+            batch.attn_metadata = self.build_decode_metadata(reqs)
 
-    def _build_prefill_metadata(self, reqs: List[Req]) -> PrefillMetadata:
-        extend_lens = [req.extend_len for req in reqs]
-        kv_lens = [req.device_len for req in reqs]
-        cached_lens = [req.cached_len for req in reqs]
+    def build_prefill_metadata(
+        self,
+        reqs: List[Req],
+        *,
+        extend_lens: List[int] | None = None,
+        kv_lens: List[int] | None = None,
+        positions: mx.array | None = None,
+    ) -> PrefillMetadata:
+        """Build paged prefill metadata.
+
+        Defaults are inferred from each ``req``'s ``cached_len`` /
+        ``device_len`` / ``extend_len``.  Callers that need to drive a
+        forward pass over a *virtual* extend window (e.g. MTP target
+        verify, which evaluates ``K+1`` positions per req while the
+        req's own ``extend_len`` is still ``1``) can override
+        ``extend_lens`` and ``kv_lens``; ``positions`` falls back to
+        ``arange(cached, kv)`` per req where
+        ``cached = kv_lens[i] - extend_lens[i]``.
+        """
+        if extend_lens is None:
+            extend_lens = [req.extend_len for req in reqs]
+        if kv_lens is None:
+            kv_lens = [req.device_len for req in reqs]
+        cached_lens = [kv_lens[i] - extend_lens[i] for i in range(len(reqs))]
+        if positions is None:
+            positions = mx.concatenate(
+                [
+                    mx.arange(cached_lens[i], kv_lens[i], dtype=mx.int32)
+                    for i in range(len(reqs))
+                ]
+            )
 
         qo_indptr = _build_indptr(extend_lens)
         kv_indptr = _build_indptr(kv_lens)
-
         kv_indices = mx.concatenate(
-            [self.page_table[req.table_idx, : req.device_len] for req in reqs]
+            [
+                self.page_table[reqs[i].table_idx, : kv_lens[i]]
+                for i in range(len(reqs))
+            ]
         )
         prefix_lens = mx.array(cached_lens, dtype=mx.int32)
-        positions = _make_positions(reqs)
 
         return PrefillMetadata(
             positions=positions,
@@ -143,15 +171,36 @@ class AttnBackend:
             max_len_extend=max(extend_lens),
         )
 
-    def _build_decode_metadata(self, reqs: List[Req]) -> DecodeMetadata:
-        kv_lens = [req.device_len for req in reqs]
+    def build_decode_metadata(
+        self,
+        reqs: List[Req],
+        *,
+        kv_lens: List[int] | None = None,
+        positions: mx.array | None = None,
+    ) -> DecodeMetadata:
+        """Build paged decode metadata.
+
+        Defaults are inferred from each ``req`` — ``kv_lens =
+        req.device_len`` and ``positions = req.cached_len``.  Callers
+        that step the decode loop manually (e.g. MTP draft regular /
+        bonus steps, where the req hasn't been advanced yet) can
+        override either field; both apply per-req as ``[B]``.
+        """
+        if kv_lens is None:
+            kv_lens = [req.device_len for req in reqs]
+        if positions is None:
+            positions = mx.array(
+                [req.cached_len for req in reqs], dtype=mx.int32
+            )
 
         kv_indptr = _build_indptr(kv_lens)
         kv_indices = mx.concatenate(
-            [self.page_table[req.table_idx, : req.device_len] for req in reqs]
+            [
+                self.page_table[reqs[i].table_idx, : kv_lens[i]]
+                for i in range(len(reqs))
+            ]
         )
         num_kv_splits = _compute_num_kv_splits(kv_lens)
-        positions = mx.array([req.cached_len for req in reqs], dtype=mx.int32)
 
         return DecodeMetadata(
             positions=positions,
@@ -168,14 +217,6 @@ class AttnBackend:
 def _build_indptr(lens: List[int]) -> mx.array:
     """Build CSR indptr array from a list of lengths."""
     return mx.cumsum(mx.array([0] + lens, dtype=mx.int32))
-
-
-def _make_positions(reqs: List[Req]) -> mx.array:
-    """Build position IDs for RoPE: arange(cached_len, device_len) per request."""
-    parts = [
-        mx.arange(req.cached_len, req.device_len, dtype=mx.int32) for req in reqs
-    ]
-    return mx.concatenate(parts)
 
 
 def _compute_num_kv_splits(kv_lens: List[int]) -> mx.array:

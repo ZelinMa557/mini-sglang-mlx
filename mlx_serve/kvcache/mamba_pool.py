@@ -88,12 +88,50 @@ class MambaStatePool:
         self._zero_slot(slot)
         return slot
 
+    def alloc_many(self, n: int) -> List[int] | None:
+        """Allocate ``n`` slots in one Python call (no zero-init).
+
+        Slots are returned in arbitrary order. Caller is responsible for
+        zeroing if needed — for MTP checkpoint slots we don't need to
+        zero because the GDN-verify kernel reads from ``slot_ids[:, 0]``
+        (the req's main slot, already populated) and writes to all
+        ``slot_ids[:, j]`` before any of those slots are read.
+        """
+        if n == 0:
+            return []
+        if len(self._free_slots) < n:
+            return None
+        slots = self._free_slots[-n:]
+        del self._free_slots[-n:]
+        return slots
+
     def free(self, slot: int) -> None:
         assert 1 <= slot <= self.num_slots, f"Invalid slot {slot}"
         self._free_slots.append(slot)
 
+    def free_many(self, slots: List[int]) -> None:
+        """Return ``slots`` to the free pool in one Python call."""
+        if not slots:
+            return
+        self._free_slots.extend(slots)
+
     def copy(self, src: int, dst: int) -> None:
         """Copy all mamba state from *src* slot to *dst* slot."""
+        for layer_convs in self._conv_buffers:
+            for buf in layer_convs:
+                buf[dst] = buf[src]
+        for buf in self._temporal_buffers:
+            buf[dst] = buf[src]
+
+    def copy_batched(self, src: mx.array, dst: mx.array) -> None:
+        """Batched scatter-copy: for each i, copy slot src[i] -> slot dst[i].
+
+        ``src`` and ``dst`` are int32 arrays of the same shape.  Used by
+        MTP target-verify rollback: after greedy verification, we copy
+        ``slot_ids[i, accepted_i]`` (state after last accepted token) to
+        ``req.mamba_slot`` (the req's persistent main slot).
+        """
+        assert src.shape == dst.shape
         for layer_convs in self._conv_buffers:
             for buf in layer_convs:
                 buf[dst] = buf[src]

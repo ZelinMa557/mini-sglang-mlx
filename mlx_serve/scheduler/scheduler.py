@@ -21,7 +21,13 @@ from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
 from .table import TableManager
 
-from mlx_serve.engine import BatchSamplingArgs, ForwardOutput
+from mlx_serve.engine import (
+    BatchSamplingArgs,
+    EagleMTPEngine,
+    ForwardOutput,
+    SpecForwardOutput,
+    create_engine,
+)
 
 
 logger = init_logger(__name__)
@@ -38,24 +44,38 @@ ForwardData: TypeAlias = tuple[ForwardInput, ForwardOutput]
 
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
-        from mlx_serve.engine import Engine
-
-        self.engine = Engine(config)
+        self.engine = create_engine(config)
         super().__init__(config)
 
+        self.is_mtp = isinstance(self.engine, EagleMTPEngine)
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         self.is_hybrid = self.engine.is_hybrid
         if self.is_hybrid:
             from .cache import HybridCacheManager
+            # MTP shares page IDs with the target via the mirrored draft
+            # KV cache, so the regular HybridCacheManager + radix tree
+            # works as-is — every cached page holds both target and
+            # draft K/V.
             self.cache_manager = HybridCacheManager(
                 None, self.engine.num_pages, self.engine.mamba_pool,
             )
         else:
-            self.cache_manager = CacheManager(None, self.engine.num_pages, config.cache_type)
-        self.decode_manager = DecodeManager()
+            self.cache_manager = CacheManager(
+                None, self.engine.num_pages, config.cache_type,
+            )
+
+        # MTP reserves K extra KV pages per running req per iter; bump
+        # ``DecodeManager.extra_per_req`` so the prefill scheduler
+        # accounts for that peak when admitting new requests.
+        extra_per_req = self.engine.K if self.is_mtp else 0  # type: ignore[attr-defined]
+        self.decode_manager = DecodeManager(extra_per_req=extra_per_req)
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
+
+        if self.is_mtp:
+            assert isinstance(self.engine, EagleMTPEngine)
+            self.engine.set_cache_manager(self.cache_manager)
 
         self.finished_reqs: Set[Req] = set()
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_path)
@@ -161,12 +181,16 @@ class Scheduler(SchedulerIOMixin):
             self.engine.gdn_backend.prepare_batch(batch)
         return ForwardInput(batch=batch, sample_args=self.engine.sampler.prepare(batch))
 
-    def _schedule_next_batch(self) -> ForwardInput | None:
+    def _select_batch(self) -> Batch | None:
+        """Choose the next batch (prefill preferred over decode)."""
         # TODO: support other policies: e.g. DECODE first
-        batch = (
+        return (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
         )
+
+    def _schedule_next_batch(self) -> ForwardInput | None:
+        batch = self._select_batch()
         return self._prepare_batch(batch) if batch else None
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
@@ -175,6 +199,96 @@ class Scheduler(SchedulerIOMixin):
         mx.eval(forward_output.next_tokens)
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+    # ════════════════════════════════════════════════════════════════
+    # MTP-specific output processing
+    # ════════════════════════════════════════════════════════════════
+
+    def _process_mtp_output(
+        self, batch: Batch, output: SpecForwardOutput,
+    ) -> None:
+        """Iterate ``output.accepted_tokens`` per req, handling EOS / max_tokens.
+
+        The engine has already updated each req's ``input_ids`` /
+        ``cached_len`` / ``device_len`` and stored the next ``pending_*``
+        fields.  Our job is to (a) emit detokenizer messages for the new
+        tokens, truncating to respect max_tokens / EOS, and (b) mark and
+        clean up reqs that should stop.
+        """
+        # One eval so the per-req ``.tolist()`` calls below are cheap.
+        mx.eval(*output.accepted_tokens)
+
+        reply: List[DetokenizeMsg] = []
+        for i, req in enumerate(batch.reqs):
+            if req in self.finished_reqs or isinstance(req, ChunkedReq):
+                continue
+
+            accepted_list: List[int] = output.accepted_tokens[i].tolist()
+
+            # MTP can over-commit by up to K tokens in a single iter
+            # (verify accepted more than ``max_tokens - generated_so_far``).
+            # Truncate the user-visible report so total generated tokens
+            # never exceed ``max_tokens``.  Internal req state may still
+            # carry the extras; they get freed on req cleanup.
+            overshoot = max(0, req.device_len - req.max_device_len)
+            if overshoot >= len(accepted_list):
+                accepted_list = []
+            elif overshoot > 0:
+                accepted_list = accepted_list[:-overshoot]
+
+            finished = False
+            finish_reason: str | None = None
+            for j, tok in enumerate(accepted_list):
+                is_eos = (
+                    tok == self.eos_token_id
+                    and not req.sampling_params.ignore_eos
+                )
+                is_last = j == len(accepted_list) - 1
+                # Last token of the iter ends the request if we overshot
+                # or used up the per-req budget (post-engine state).
+                hit_budget = is_last and (overshoot > 0 or not req.can_decode())
+                this_finished = is_eos or hit_budget
+                reply.append(
+                    DetokenizeMsg(
+                        uid=req.uid, next_token=tok, finished=this_finished,
+                    )
+                )
+                if this_finished:
+                    finished = True
+                    finish_reason = "eos" if is_eos else "max_tokens"
+                    break
+
+            # Defensive: if the iter produced nothing visible (full
+            # overshoot truncation) but the req is out of budget, still
+            # mark it finished so cleanup happens.
+            if not finished and (overshoot > 0 or not req.can_decode()):
+                finished = True
+                finish_reason = "max_tokens"
+
+            if finished:
+                input_len = req.max_device_len - req.output_len
+                logger.info(
+                    "[Done] uid=%d  reason=%s  total_tokens=%d",
+                    req.uid, finish_reason, req.cached_len - input_len,
+                )
+                self.finished_reqs.add(req)
+                self.decode_manager.remove_req(req)
+
+        # Resource cleanup for finished reqs.  Pages are SHARED between
+        # target and draft (mirrored), so a single free_and_cache call
+        # releases both — radix insertion stores the page IDs that hold
+        # both target and draft K/V together.
+        for req in self.finished_reqs:
+            self.table_manager.free(req.table_idx)
+            self.cache_manager.free_and_cache_finished_req(
+                req.cache_handle,
+                req.input_ids[: req.cached_len],
+                self.page_table[req.table_idx, : req.cached_len],
+                mamba_slot=req.mamba_slot,
+            )
+
+        self.finished_reqs.clear()
+        self.send_result(reply)
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
@@ -186,12 +300,29 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
+        if self.is_mtp:
+            self._mtp_loop_step()
+        else:
+            self._non_mtp_loop_step()
+
+    def _non_mtp_loop_step(self) -> None:
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
             ongoing_data = (forward_input, self._forward(forward_input))
 
         self._process_last_data(ongoing_data)
+
+    def _mtp_loop_step(self) -> None:
+        assert isinstance(self.engine, EagleMTPEngine)
+        batch = self._select_batch()
+        if batch is None:
+            return
+        # The engine handles all KV / mamba alloc + free + sub-forwards
+        # and returns variable-length accepted tokens per req.
+        spec_output = self.engine.run_iter(batch)
+        self.decode_manager.filter_reqs(batch.reqs)
+        self._process_mtp_output(batch, spec_output)
 
     def run_forever(self) -> NoReturn:
         while True:
