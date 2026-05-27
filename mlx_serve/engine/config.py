@@ -21,6 +21,9 @@ class EngineConfig:
     kv_cache_gb: float | None = None
     max_seq_len_override: int | None = None
     mtp_model_path: str | None = None
+    # Number of draft tokens per MTP iter (K). Verify input length is K+1.
+    # Has no effect when ``mtp_model_path`` is None.
+    num_mtp_step: int = 2
 
     @cached_property
     def hf_config(self):
