@@ -76,29 +76,3 @@ def greedy_verify(
         bonus_tokens=bonus_tokens,
         target_preds=target_preds,
     )
-
-
-def gather_last_accepted_hidden(
-    verify_hidden: mx.array,
-    num_drafts_accepted: mx.array,
-) -> mx.array:
-    """Pick the target hidden state at each req's last accepted position.
-
-    Args:
-        verify_hidden: ``[B, K+1, D]`` target hidden states from the
-            verify forward.
-        num_drafts_accepted: ``[B]`` from :func:`greedy_verify`.
-
-    Returns:
-        ``[B, D]`` — the hidden state at index ``num_drafts_accepted[i]``
-        for each req. Used as ``target_hidden_states`` for the bonus
-        draft step that produces ``pending_draft_*`` for the next iter.
-    """
-    idx = num_drafts_accepted[:, None, None]
-    # Broadcasting take_along_axis with a 3-D index along axis 1 then
-    # squeeze — keeps the whole gather on-device.
-    return mx.take_along_axis(
-        verify_hidden,
-        mx.broadcast_to(idx, (verify_hidden.shape[0], 1, verify_hidden.shape[-1])),
-        axis=1,
-    ).squeeze(axis=1)
