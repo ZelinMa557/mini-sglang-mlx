@@ -3,17 +3,25 @@
 This engine drives the Qwen3.5 MTP draft model alongside the target.
 Each decode iter does:
 
-    * ``K`` regular draft forwards (``K = num_mtp_step``) to produce
-      drafts ``D_2..D_K`` and to commit the KV of every draft input
-      ``D_1..D_K`` into the draft cache.  ``D_1`` itself comes from
-      the previous iter / prefill.
+    * ``K-1`` regular draft forwards (``K = num_mtp_step``) to produce
+      drafts ``D_2..D_K``.  ``D_1`` itself comes from the previous
+      iter / prefill — so ``K-1`` forwards yield ``K`` total drafts.
+      Each forward writes the draft K/V at its position using the
+      draft's own previous hidden as a *proxy* for the target hidden.
     * A single target verify pass over ``[T, D_1, ..., D_K]`` (K+1
-      tokens) that greedy-accepts the longest matching prefix.
-    * One *bonus* draft forward on the freshly sampled bonus token to
-      pre-stage the next iter's ``pending_draft_token`` /
-      ``pending_draft_hidden`` (mirrors what prefill leaves behind).
+      tokens) that greedy-accepts the longest matching prefix and
+      yields real target hidden states ``h_c..h_{c+K}``.
+    * A *calibration prefill* on the draft model over
+      ``[D_1, .., D_{j}, bonus]`` per req, feeding the verify-time
+      target hidden as ``target_hidden_states``.  This overwrites the
+      proxy-hidden K/V from the regular forwards with K/V derived
+      from REAL target hidden, keeping draft accuracy from drifting
+      over long generations, AND produces ``pending_draft_token`` /
+      ``pending_draft_hidden`` for the next iter (last sample / last
+      hidden of the calibration).
 
-Total draft forwards per decode iter: ``K + 1``.
+Total draft forwards per decode iter: ``K - 1`` decode steps + 1
+prefill (sized ``j+1 ≤ K+1`` tokens per req).
 
 Mirrored page layout
 --------------------
@@ -66,11 +74,7 @@ from mlx_serve.utils import init_logger
 
 from .config import EngineConfig
 from .engine import Engine
-from .spec_sample import (
-    GreedyVerifyResult,
-    gather_last_accepted_hidden,
-    greedy_verify,
-)
+from .spec_sample import GreedyVerifyResult, greedy_verify
 
 if TYPE_CHECKING:
     from mlx_serve.scheduler.cache import CacheManager
@@ -265,7 +269,7 @@ class EagleMTPEngine(Engine):
         return SpecForwardOutput(accepted_tokens=accepted)
 
     # ════════════════════════════════════════════════════════════════
-    # Decode iter: K regular draft steps → verify → bonus draft step
+    # Decode iter: K-1 draft steps → verify → calibration prefill
     # ════════════════════════════════════════════════════════════════
 
     def _run_decode_iter(self, batch: Batch) -> SpecForwardOutput:
@@ -277,9 +281,12 @@ class EagleMTPEngine(Engine):
         # ---- Pre-allocate B*(K+1) shared pages -----------------------
         # One slab per req, K+1 pages wide, covering positions
         # cached_len..cached_len+K.  The SAME page IDs are used by both
-        # target (verify) and draft (K regular + 1 bonus step) — page i
-        # of slab[r] simultaneously addresses target_kv_cache and
-        # draft_kv_cache.  Page_table is stamped once here.
+        # target verify (K+1 positions) and the draft work this iter
+        # (K-1 regular forwards write slabs[:, 0..K-2]; calibration
+        # prefill writes slabs[:, 0..j_i] where j_i ≤ K).  Slot i of
+        # slab[r] simultaneously addresses target_kv_cache and
+        # draft_kv_cache via the mirrored page layout — page_table is
+        # stamped once here for both consumers.
         flat_pages = self.cache_manager.allocate(B * verify_len)
         slabs = flat_pages.reshape(B, verify_len)
         for i, r in enumerate(reqs):
@@ -293,18 +300,17 @@ class EagleMTPEngine(Engine):
         cur_token = mx.stack([r.pending_draft_token for r in reqs]).squeeze(-1)
         cur_hidden = mx.stack([r.pending_draft_hidden for r in reqs])
 
-        # ---- K regular draft steps -----------------------------------
-        # D_1 = pending_draft_token came from prev iter (or prefill).
-        # We run K draft forwards rather than K-1: the first K-1 produce
-        # D_2..D_K, and the K-th step processes D_K as input to commit
-        # its KV at draft slot ``cached_len + K - 1`` — required so the
-        # bonus step's attention reads a valid slot when j=K (all drafts
-        # accepted).  The K-th output is discarded.
+        # ---- K-1 regular draft decode forwards -----------------------
+        # ``D_1 = pending_draft_token`` came from the prev iter / prefill,
+        # so we only need K-1 more forwards (D_2..D_K) to hand the target
+        # K drafts to verify.  Step ``k`` writes draft K/V at page ID
+        # ``slabs[:, k]`` using the draft's own previous hidden as a
+        # *proxy* for target hidden — the calibration prefill below
+        # overwrites this with K/V derived from real target hidden.
         #
-        # Step k writes draft K/V at page ID ``slabs[:, k]`` (= same ID
-        # target_verify will write its K/V at for position cached_len+k).
+        # When ``K == 1`` this loop is empty: ``drafts = [D_1]`` already.
         drafts_per_step: List[mx.array] = [cur_token]
-        for step in range(K):
+        for step in range(K - 1):
             cur_lens = [r.cached_len + step for r in reqs]
             step_out_loc = slabs[:, step]  # [B] page IDs
             draft_batch = self._build_draft_decode_batch(
@@ -317,10 +323,8 @@ class EagleMTPEngine(Engine):
                 cur_hidden, d_logits = self.draft_model(
                     cur_token, cur_hidden, return_hidden=True
                 )
-            next_token = mx.argmax(d_logits, axis=-1).astype(mx.int32)
-            if step < K - 1:
-                drafts_per_step.append(next_token)
-            cur_token = next_token
+            cur_token = mx.argmax(d_logits, axis=-1).astype(mx.int32)
+            drafts_per_step.append(cur_token)
         drafts = mx.stack(drafts_per_step, axis=1)  # [B, K]
 
         # ---- Target verify on [T, D_1, ..., D_K] --------------------
@@ -339,29 +343,93 @@ class EagleMTPEngine(Engine):
         verify_hidden = verify_hidden_flat.reshape(B, verify_len, D)
         verify_logits = verify_logits_flat.reshape(B, verify_len, V)
 
-        # ---- Greedy acceptance --------------------------------------
+        # ---- Greedy acceptance + single host sync -------------------
+        # Counts + bonus + drafts in one eval so the subsequent per-req
+        # bookkeeping doesn't trigger extra flushes.  ``verify_hidden``
+        # is left lazy: the calibration prefill below consumes slices
+        # of it on-device.
         result: GreedyVerifyResult = greedy_verify(verify_logits, drafts)
-        last_accepted_hidden = gather_last_accepted_hidden(
-            verify_hidden, result.num_drafts_accepted
-        )
-
-        # Single host sync: counts + bonus + drafts in one eval so the
-        # subsequent per-req bookkeeping doesn't trigger extra flushes.
-        mx.eval(
-            result.num_drafts_accepted,
-            result.bonus_tokens,
-            drafts,
-            last_accepted_hidden,
-        )
+        mx.eval(result.num_drafts_accepted, result.bonus_tokens, drafts)
         num_accepted_host: List[int] = result.num_drafts_accepted.tolist()
         bonus_host: List[int] = result.bonus_tokens.tolist()
         drafts_host: List[List[int]] = drafts.tolist()
 
-        # ---- Roll back mamba state ----------------------------------
-        # slot_ids[i, 0] is the req's main slot; it was overwritten by
-        # the verify kernel with "state after T". If j_i >= 1 drafts
-        # were accepted, the correct post-iter state lives in
-        # slot_ids[i, j_i] and we copy it back to the main slot.
+        # ---- Draft calibration prefill ------------------------------
+        # Re-run draft over (D_1..D_{j_i}, bonus_i) per req with REAL
+        # verify hidden as ``target_hidden_states``, overwriting the
+        # proxy-hidden K/V at every newly-committed position with K/V
+        # derived from real target hidden.  This keeps the draft K/V
+        # cache "calibrated" so its accuracy doesn't drift across long
+        # generations.  Also produces ``pending_draft_*`` for the next
+        # iter (last logits / hidden of this prefill).
+        calib_batch, calib_input_ids, calib_target_hidden = (
+            self._build_draft_calibration_batch(
+                reqs, drafts, result.bonus_tokens, verify_hidden,
+                slabs, num_accepted_host,
+            )
+        )
+        with (
+            use_ctx(self.draft_ctx),
+            self.draft_ctx.forward_batch(calib_batch),
+        ):
+            new_dh, new_dlogits = self.draft_model(
+                calib_input_ids, calib_target_hidden, return_hidden=True,
+            )
+        last_indices = calib_batch.attn_metadata.get_last_indices(B)
+        new_dh_last = new_dh[last_indices]  # [B, D]
+        new_D1 = mx.argmax(
+            new_dlogits[last_indices], axis=-1,
+        ).astype(mx.int32)  # [B]
+        mx.eval(new_D1, new_dh_last)
+
+        # ---- Release per-iter resources -----------------------------
+        # Strictly AFTER the calibration prefill so that any pages /
+        # mamba state the calibration needed to read are still live.
+        self._release_iter_resources(
+            reqs, num_accepted_host, slabs, slot_ids_rows, new_mamba_slots,
+        )
+
+        # ---- Per-req state update + accepted_tokens output ----------
+        accepted: List[mx.array] = []
+        for i, r in enumerate(reqs):
+            j = num_accepted_host[i]
+            # New tokens this iter that go on input_ids: D_1..D_j + bonus.
+            tail_list = drafts_host[i][:j] + [bonus_host[i]]
+            tail = mx.array(tail_list, dtype=mx.int32)
+            r.input_ids = mx.concatenate([r.input_ids, tail])
+            r.complete_many(j + 1)
+            r.pending_token = tail[-1:]
+            r.pending_draft_token = new_D1[i : i + 1]
+            r.pending_draft_hidden = new_dh_last[i]
+            accepted.append(tail)
+        return SpecForwardOutput(accepted_tokens=accepted)
+
+    def _release_iter_resources(
+        self,
+        reqs: List[Req],
+        num_accepted_host: List[int],
+        slabs: mx.array,
+        slot_ids_rows: List[List[int]],
+        new_mamba_slots: List[int],
+    ) -> None:
+        """Free per-iter mamba checkpoint slots + unused KV pages.
+
+        Must be called AFTER both verify and the draft calibration
+        prefill, since both passes still read from these resources.
+        Per req ``i`` (``j_i = num_drafts_accepted``):
+
+        * **Mamba** (hybrid only).  ``slot_ids[i, 0]`` was the req's
+          main slot before this iter; verify clobbered it with "state
+          after T". The correct post-iter state lives in
+          ``slot_ids[i, j_i]`` ("state after the last accepted token"),
+          which we copy back to the main slot.  All ``B*K`` new
+          checkpoint slots are then returned to the pool.
+        * **KV pages**.  Keep ``slabs[i, 0..j_i]`` (``j_i+1`` pages =
+          the accepted prefix, shared by target and draft via the
+          mirrored layout); free ``slabs[i, j_i+1..K]`` (``K-j_i``
+          pages, both target and draft K/V reclaimed together).
+        """
+        K = self.K
         if self.is_hybrid:
             src_slots: List[int] = []
             dst_slots: List[int] = []
@@ -379,61 +447,12 @@ class EagleMTPEngine(Engine):
             assert self.mamba_pool is not None
             self.mamba_pool.free_many(new_mamba_slots)
 
-        # ---- Free unused (shared) pages -----------------------------
-        # For req i: keep slabs[i, 0..j_i] (j_i+1 pages = accepted
-        # prefix), free slabs[i, j_i+1..K] (K-j_i pages).  Both
-        # target's and draft's K/V at those page IDs return to the pool
-        # together — no separate "free draft pages" pass.
         free_chunks: List[mx.array] = []
         for i, j in enumerate(num_accepted_host):
             if K - j > 0:
                 free_chunks.append(slabs[i, j + 1 :])
         if free_chunks:
-            # ``CacheManager._free`` accepts batched indices.
             self.cache_manager._free(mx.concatenate(free_chunks))
-
-        # ---- Bonus draft step ---------------------------------------
-        # One extra draft step on the verified bonus token to pre-stage
-        # D_1 + draft hidden for next iter (mirrors what prefill leaves
-        # behind).  Writes draft K/V at slabs[i, j_i] (= page_table
-        # entry for position cached_len+j_i), overwriting whatever the
-        # regular step j_i wrote there (= D_{j_i+1}'s draft K/V).  The
-        # target K/V at that same page ID stays intact (different
-        # buffer), so the slot ends up with target K/V for D_{j_i} and
-        # draft K/V for the bonus token — both are what the next iter
-        # needs to read.
-        j_arr = mx.array(num_accepted_host, dtype=mx.int32)
-        bonus_out_loc = mx.take_along_axis(
-            slabs, j_arr[:, None], axis=1,
-        ).squeeze(axis=1)
-        bonus_positions = [r.cached_len + num_accepted_host[i] for i, r in enumerate(reqs)]
-        bonus_batch = self._build_draft_decode_batch(
-            reqs, bonus_positions, bonus_out_loc,
-        )
-        with (
-            use_ctx(self.draft_ctx),
-            self.draft_ctx.forward_batch(bonus_batch),
-        ):
-            new_dh, new_dlogits = self.draft_model(
-                result.bonus_tokens, last_accepted_hidden, return_hidden=True,
-            )
-        new_D1 = mx.argmax(new_dlogits, axis=-1).astype(mx.int32)
-        mx.eval(new_D1, new_dh)
-
-        # ---- Per-req state update + accepted_tokens output ----------
-        accepted: List[mx.array] = []
-        for i, r in enumerate(reqs):
-            j = num_accepted_host[i]
-            # New tokens this iter that go on input_ids: D_1..D_j + bonus.
-            tail_list = drafts_host[i][:j] + [bonus_host[i]]
-            tail = mx.array(tail_list, dtype=mx.int32)
-            r.input_ids = mx.concatenate([r.input_ids, tail])
-            r.complete_many(j + 1)
-            r.pending_token = tail[-1:]
-            r.pending_draft_token = new_D1[i : i + 1]
-            r.pending_draft_hidden = new_dh[i]
-            accepted.append(tail)
-        return SpecForwardOutput(accepted_tokens=accepted)
 
     # ════════════════════════════════════════════════════════════════
     # Batch / metadata builders
@@ -537,6 +556,84 @@ class EagleMTPEngine(Engine):
         batch.padded_reqs = reqs
         batch.attn_metadata = metadata
         return batch
+
+    def _build_draft_calibration_batch(
+        self,
+        reqs: List[Req],
+        drafts: mx.array,
+        bonus_tokens: mx.array,
+        verify_hidden: mx.array,
+        slabs: mx.array,
+        num_accepted_host: List[int],
+    ) -> Tuple[Batch, mx.array, mx.array]:
+        """Build the per-iter draft *calibration* prefill batch.
+
+        For each req ``i`` with ``j_i = num_drafts_accepted``, builds a
+        prefill window of ``j_i + 1`` positions corresponding to draft
+        logical positions ``c..c+j_i`` (``c = req.cached_len``).  Per
+        position:
+
+        ===========  ===============================  ====================
+        position     input token (shifted convention) target_hidden source
+        ===========  ===============================  ====================
+        ``c+k``      ``D_{k+1}`` (k < j_i) / bonus    ``verify_hidden[i, k]``
+        ===========  ===============================  ====================
+
+        Page IDs mirror the first ``j_i + 1`` columns of each req's
+        shared slab, so the draft K/V written here overlaps the same
+        page IDs as the (kept) target K/V from verify.
+
+        Args:
+            reqs: Batch reqs (their ``cached_len`` is still pre-iter).
+            drafts: ``[B, K]`` int32 — the K drafts sampled this iter.
+            bonus_tokens: ``[B]`` int32 — target's bonus per req.
+            verify_hidden: ``[B, K+1, D]`` — real target hidden from
+                verify.  Slice ``[i, :j_i+1]`` feeds the draft.
+            slabs: ``[B, K+1]`` int32 — page IDs reserved for this iter.
+            num_accepted_host: ``[B]`` Python ints (j_i values).
+
+        Returns:
+            ``(batch, input_ids, target_hidden)``:
+                * ``batch``: ``PREFILL``-phase batch wired with the
+                  draft's attention metadata + per-req ``out_loc``.
+                  ``batch.input_ids`` is a placeholder — the draft
+                  model takes the real ``input_ids`` and
+                  ``target_hidden_states`` directly as call args.
+                * ``input_ids`` ``[sum(j_i+1)]``: concatenated draft
+                  input tokens in batch order.
+                * ``target_hidden`` ``[sum(j_i+1), D]``: matching
+                  target hidden states.
+        """
+        input_parts: List[mx.array] = []
+        target_hidden_parts: List[mx.array] = []
+        out_loc_parts: List[mx.array] = []
+        extend_lens: List[int] = []
+        kv_lens: List[int] = []
+
+        for i, r in enumerate(reqs):
+            j = num_accepted_host[i]
+            # D_1..D_j (possibly empty when j=0) + bonus.
+            input_parts.append(
+                mx.concatenate([drafts[i, :j], bonus_tokens[i : i + 1]])
+            )
+            target_hidden_parts.append(verify_hidden[i, : j + 1])
+            out_loc_parts.append(slabs[i, : j + 1])
+            extend_lens.append(j + 1)
+            kv_lens.append(r.cached_len + j + 1)
+
+        input_ids = mx.concatenate(input_parts)
+        target_hidden = mx.concatenate(target_hidden_parts, axis=0)
+        out_loc = mx.concatenate(out_loc_parts)
+
+        metadata = self.draft_attn_backend.build_prefill_metadata(
+            reqs, extend_lens=extend_lens, kv_lens=kv_lens,
+        )
+        batch = Batch(reqs=reqs, phase=BatchPhase.PREFILL)
+        batch.input_ids = mx.array([], dtype=mx.int32)
+        batch.out_loc = out_loc
+        batch.padded_reqs = reqs
+        batch.attn_metadata = metadata
+        return batch, input_ids, target_hidden
 
     def _build_target_verify_batch(
         self,
