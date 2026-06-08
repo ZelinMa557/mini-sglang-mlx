@@ -19,7 +19,8 @@ namespace mlx_serve {
 /// kv_indices:   (total_kv,)   page indices for all KV tokens
 /// prefix_lens:  (batch,)      prefix length per sequence
 ///
-/// Causal masking is always applied for the extend region.
+/// By default, causal masking is applied for the extend region. DFlash can
+/// request full attention or a sliding causal window within the same KV stream.
 mx::array paged_prefill_attention(
     const mx::array& q,
     const mx::array& k_cache,
@@ -30,6 +31,8 @@ mx::array paged_prefill_attention(
     const mx::array& prefix_lens,
     float sm_scale,
     int max_len_extend,
+    bool is_cross_attention = false,
+    int sliding_window_size = 0,
     mx::StreamOrDevice s = {});
 
 class PagedPrefillAttention : public mx::Primitive {
@@ -41,14 +44,18 @@ class PagedPrefillAttention : public mx::Primitive {
       int num_q_heads,
       int num_kv_heads,
       int head_dim,
-      int total_q_tokens)
+      int total_q_tokens,
+      bool is_cross_attention,
+      int sliding_window_size)
       : mx::Primitive(stream),
         sm_scale_(sm_scale),
         max_len_extend_(max_len_extend),
         num_q_heads_(num_q_heads),
         num_kv_heads_(num_kv_heads),
         head_dim_(head_dim),
-        total_q_tokens_(total_q_tokens) {}
+        total_q_tokens_(total_q_tokens),
+        is_cross_attention_(is_cross_attention ? 1 : 0),
+        sliding_window_size_(sliding_window_size) {}
 
   void eval_cpu(
       const std::vector<mx::array>& inputs,
@@ -70,6 +77,8 @@ class PagedPrefillAttention : public mx::Primitive {
   int num_kv_heads_;
   int head_dim_;
   int total_q_tokens_;
+  int is_cross_attention_;
+  int sliding_window_size_;
 };
 
 }  // namespace mlx_serve

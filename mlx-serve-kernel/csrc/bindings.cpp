@@ -46,12 +46,14 @@ NB_MODULE(_ext, m) {
   m.def("paged_prefill_attention", &mlx_serve::paged_prefill_attention,
         "q"_a, "k_cache"_a, "v_cache"_a, "qo_indptr"_a, "kv_indptr"_a,
         "kv_indices"_a, "prefix_lens"_a, "sm_scale"_a, "max_len_extend"_a,
-        nb::kw_only(), "stream"_a = nb::none(),
+        nb::kw_only(), "is_cross_attention"_a = false,
+        "sliding_window_size"_a = 0, "stream"_a = nb::none(),
         nb::sig(
             "def paged_prefill_attention(q: array, k_cache: array, v_cache: array, "
             "qo_indptr: array, kv_indptr: array, kv_indices: array, "
-            "prefix_lens: array, sm_scale: float, max_len_extend: int, "
-            "*, stream: Union[None, Stream, Device] = None) -> array"));
+            "prefix_lens: array, sm_scale: float, max_len_extend: int, *, "
+            "is_cross_attention: bool = False, sliding_window_size: int = 0, "
+            "stream: Union[None, Stream, Device] = None) -> array"));
   m.def("gdn_state_inplace", &mlx_serve::gdn_state_inplace,
         "q"_a, "k"_a, "v"_a, "g"_a, "beta"_a, "state"_a, "slot_ids"_a,
         "qo_indptr"_a, "single_token_mode"_a = false, nb::kw_only(),

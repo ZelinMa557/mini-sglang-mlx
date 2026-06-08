@@ -322,6 +322,34 @@ METAL_FUNC void apply_causal_mask(
 }
 
 template <typename T>
+METAL_FUNC void apply_attention_mask(
+    thread FragVec<T>& frag,
+    int q_block_start,
+    int kv_block_start,
+    int cur_prefix_len,
+    bool is_cross_attention,
+    int sliding_window_size) {
+  constexpr T neg_inf = -HUGE_VALF;
+  const short2 sc = BaseFrag::get_coord();
+  for (short i = 0; i < kElemRows; ++i) {
+    for (short j = 0; j < kElemCols; ++j) {
+      const short row = i * kElemRowsJump + sc.y;
+      const short col = sc.x + j;
+      const short idx = i * kElemCols + j;
+      const int q_pos = cur_prefix_len + q_block_start + row;
+      const int kv_pos = kv_block_start + col;
+      const bool in_causal = is_cross_attention || (kv_pos <= q_pos);
+      const bool in_window =
+          (sliding_window_size == 0) ||
+          (kv_pos >= q_pos - sliding_window_size + 1);
+      if (!(in_causal && in_window)) {
+        frag[idx] = neg_inf;
+      }
+    }
+  }
+}
+
+template <typename T>
 METAL_FUNC void scale_frag(thread FragVec<T>& frag, T scale) {
   for (short i = 0; i < kElemsPerFrag; ++i) {
     frag[i] *= scale;
@@ -365,6 +393,8 @@ template <
     constant float& sm_scale             [[buffer(8)]],
     constant int& num_q_heads            [[buffer(9)]],
     constant int& num_kv_heads           [[buffer(10)]],
+    constant int& is_cross_attention_i   [[buffer(11)]],
+    constant int& sliding_window_size     [[buffer(12)]],
     ushort sgitg [[simdgroup_index_in_threadgroup]],
     uint3 tgpig [[threadgroup_position_in_grid]]) {
   static_assert(BLOCK_M == 64, "paged_prefill_attention expects BLOCK_M == 64");
@@ -407,9 +437,13 @@ template <
   const int o_stride_head = DV;
   const int o_stride_token = num_q_heads * DV;
   const float sm_scale_log2e = sm_scale * M_LOG2E_F;
+  const bool is_cross_attention = is_cross_attention_i != 0;
+  const bool needs_sliding_mask = sliding_window_size > 0;
   const int causal_full_limit = cur_prefix_len + q_simd_start;
   const int kv_compute_limit =
-      min(cur_seq_kv_len, cur_prefix_len + q_simd_start + valid_m);
+      is_cross_attention
+          ? cur_seq_kv_len
+          : min(cur_seq_kv_len, cur_prefix_len + q_simd_start + valid_m);
 
   FragF o_frags[TDV];
   for (short i = 0; i < TDV; ++i) {
@@ -476,7 +510,22 @@ template <
     scale_frag(s1, sm_scale_log2e);
     apply_length_mask(s0, valid_m, min(valid_n, 16));
     apply_length_mask(s1, valid_m, max(0, valid_n - 16));
-    if (needs_causal_mask) {
+    if (needs_sliding_mask) {
+      apply_attention_mask(
+          s0,
+          q_simd_start,
+          kv_block_start,
+          cur_prefix_len,
+          is_cross_attention,
+          sliding_window_size);
+      apply_attention_mask(
+          s1,
+          q_simd_start,
+          kv_block_start + 16,
+          cur_prefix_len,
+          is_cross_attention,
+          sliding_window_size);
+    } else if (needs_causal_mask && !is_cross_attention) {
       apply_causal_mask(s0, q_simd_start, kv_block_start, cur_prefix_len);
       apply_causal_mask(s1, q_simd_start, kv_block_start + 16, cur_prefix_len);
     }
