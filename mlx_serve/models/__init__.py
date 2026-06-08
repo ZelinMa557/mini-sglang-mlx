@@ -9,7 +9,8 @@ from typing import Any, Callable, Dict, Optional, Tuple, Type, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from huggingface_hub import snapshot_download
+
+from mlx_serve.utils import resolve_repo
 
 from .base import BaseModelArgs
 
@@ -51,18 +52,6 @@ def load_config(model_path: Path) -> dict:
     return config
 
 
-def _resolve_model_path(path_or_hf_repo: str) -> Path:
-    model_path = Path(path_or_hf_repo)
-    if model_path.is_dir():
-        return model_path
-    return Path(
-        snapshot_download(
-            path_or_hf_repo,
-            allow_patterns=["*.json", "model*.safetensors", "*.py", "tokenizer.model"],
-        )
-    )
-
-
 def load_model(
     model_path: Union[str, Path],
     lazy: bool = False,
@@ -75,14 +64,19 @@ def load_model(
     optional mlx-native quantization is applied based on ``config.json``.
 
     Args:
-        model_path: Local directory or HuggingFace repo ID.
+        model_path: Local directory or HuggingFace repo ID.  For
+            ModelScope-hosted models the caller is responsible for
+            pre-resolving the path (use
+            :func:`mlx_serve.utils.resolve_repo` with
+            ``use_modelscope=True``); this loader only knows about
+            local paths and HuggingFace.
         lazy: If True, defer parameter evaluation until first use.
         model_config: Extra config overrides merged into the loaded config.
 
     Returns:
         (model, config) tuple.
     """
-    model_path = _resolve_model_path(str(model_path))
+    model_path = Path(resolve_repo(str(model_path), use_modelscope=False))
     config = load_config(model_path)
     if model_config is not None:
         config.update(model_config)

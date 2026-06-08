@@ -1,4 +1,4 @@
-from .config import EngineConfig
+from .config import SPEC_ALGOS, EngineConfig
 from .dflash_engine import DflashEngine
 from .eagle_mtp_engine import EagleMTPEngine
 from .engine import Engine, ForwardOutput
@@ -7,24 +7,28 @@ from .spec_engine import SpecEngine, SpecForwardOutput
 
 
 def create_engine(config: EngineConfig) -> Engine:
-    """Construct the right engine variant based on ``config``.
+    """Construct the right engine variant based on ``config.spec_algo``.
 
-    Selection priority (mutually exclusive in :class:`EngineConfig`):
+    Dispatch:
 
-    * ``dflash_model_path`` set → :class:`DflashEngine`.
-    * ``mtp_model_path``    set → :class:`EagleMTPEngine`.
-    * otherwise              → :class:`Engine`.
+    * ``spec_algo == "mtp"``    → :class:`EagleMTPEngine`.
+    * ``spec_algo == "dflash"`` → :class:`DflashEngine`.
+    * ``spec_algo is None``     → base :class:`Engine` (no draft).
+
+    ``EngineConfig.__post_init__`` already validates that
+    ``draft_path`` / ``num_draft_tokens`` are set when ``spec_algo``
+    is non-None, so we can dispatch directly here.
     """
-    if config.mtp_model_path is not None and config.dflash_model_path is not None:
-        raise ValueError(
-            "EngineConfig.mtp_model_path and dflash_model_path are mutually "
-            "exclusive — choose one spec method at a time."
-        )
-    if config.dflash_model_path is not None:
-        return DflashEngine(config)
-    if config.mtp_model_path is not None:
+    if config.spec_algo is None:
+        return Engine(config)
+    if config.spec_algo == "mtp":
         return EagleMTPEngine(config)
-    return Engine(config)
+    if config.spec_algo == "dflash":
+        return DflashEngine(config)
+    raise ValueError(
+        f"Unknown spec_algo {config.spec_algo!r}; expected one of "
+        f"{SPEC_ALGOS} or None."
+    )
 
 
 __all__ = [
@@ -34,6 +38,7 @@ __all__ = [
     "Engine",
     "EngineConfig",
     "ForwardOutput",
+    "SPEC_ALGOS",
     "SpecEngine",
     "SpecForwardOutput",
     "create_engine",

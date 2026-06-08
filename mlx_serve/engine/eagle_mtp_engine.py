@@ -3,7 +3,7 @@
 This engine drives the Qwen3.5 MTP draft model alongside the target.
 Each decode iter does:
 
-    * ``K-1`` regular draft forwards (``K = num_mtp_step``) to produce
+    * ``K-1`` regular draft forwards (``K = num_draft_tokens``) to produce
       drafts ``D_2..D_K``.  ``D_1`` itself comes from the previous
       iter / prefill — so ``K-1`` forwards yield ``K`` total drafts.
       Each forward writes the draft K/V at its position using the
@@ -104,19 +104,22 @@ class EagleMTPEngine(SpecEngine):
     """
 
     def __init__(self, config: EngineConfig):
-        assert config.mtp_model_path is not None, (
-            "EagleMTPEngine requires EngineConfig.mtp_model_path"
+        assert config.spec_algo == "mtp", (
+            f"EagleMTPEngine requires spec_algo='mtp', got {config.spec_algo!r}"
         )
-        assert config.num_mtp_step >= 1, (
-            f"num_mtp_step must be >= 1, got {config.num_mtp_step}"
+        assert config.draft_path is not None, (
+            "EagleMTPEngine requires EngineConfig.draft_path"
+        )
+        assert config.num_draft_tokens >= 1, (
+            f"num_draft_tokens must be >= 1, got {config.num_draft_tokens}"
         )
         super().__init__(config)
-        self.K = config.num_mtp_step
+        self.K = config.num_draft_tokens
 
         # Load the MTP draft (shares embed_tokens / lm_head with target).
-        logger.info("Loading MTP draft model from %s", config.mtp_model_path)
+        logger.info("Loading MTP draft model from %s", config.draft_path)
         self.draft_model, _ = load_qwen3_5_mtp_draft_model(
-            config.mtp_model_path, self.model
+            config.draft_path, self.model
         )
         logger.info("MTP draft model loaded and shared embed/lm_head.")
 
@@ -159,7 +162,7 @@ class EagleMTPEngine(SpecEngine):
 
     def _extra_mamba_checkpoints_per_req(self, config: EngineConfig) -> int:
         # Target verify checkpoints ``K`` extra states per req.
-        return config.num_mtp_step
+        return config.num_draft_tokens
 
     # ════════════════════════════════════════════════════════════════
     # Prefill: target prefill → sample T_1 → shifted draft prefill
