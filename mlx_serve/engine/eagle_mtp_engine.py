@@ -323,6 +323,7 @@ class EagleMTPEngine(SpecEngine):
         num_accepted_host: List[int] = result.num_drafts_accepted.tolist()
         bonus_host: List[int] = result.bonus_tokens.tolist()
         drafts_host: List[List[int]] = drafts.tolist()
+        self._log_acceptance(num_accepted_host)
 
         # ---- Draft calibration prefill ------------------------------
         # Re-run draft over (D_1..D_{j_i}, bonus_i) per req with REAL

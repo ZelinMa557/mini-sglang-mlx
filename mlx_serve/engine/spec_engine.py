@@ -17,6 +17,7 @@ in each engine stays small and focused on the draft loop itself.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Tuple
@@ -234,6 +235,17 @@ class SpecEngine(Engine, ABC):
             ]
             batch.mamba_slot_ids = mx.array(slot_ids_rows, dtype=mx.int32)
         return batch, slot_ids_rows, new_mamba_slots
+
+    def _log_acceptance(self, num_accepted_host: List[int]) -> None:
+        if not num_accepted_host or not logger.isEnabledFor(logging.DEBUG):
+            return
+        B = len(num_accepted_host)
+        mean_drafts = sum(num_accepted_host) / B
+        logger.debug(
+            "spec iter: B=%d K=%d mean_drafts=%.2f mean_accept_len=%.2f "
+            "per-req_j=%s",
+            B, self.K, mean_drafts, mean_drafts + 1.0, num_accepted_host,
+        )
 
     def _release_iter_resources(
         self,
