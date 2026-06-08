@@ -69,7 +69,7 @@ void store_kv_cache(
 
   auto s = to_stream(s_);
   auto& d = mx::metal::device(s.device);
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = mx::metal::get_command_encoder(s);
 
   std::string op_name = "store_kv_cache_" + type_to_name(k_cache);
   auto lib = d.get_library("mlx_serve_kernel", util::current_binary_dir());

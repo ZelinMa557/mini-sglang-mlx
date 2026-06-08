@@ -119,7 +119,7 @@ void PagedPrefillAttention::eval_gpu(
   int batch = qo_indptr.shape(0) - 1;
   std::string tname = dtype_to_str(q);
 
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = mx::metal::get_command_encoder(s);
   auto lib = d.get_library("mlx_serve_kernel", util::current_binary_dir());
 
   std::string kernel_name = "paged_prefill_attention_" + tname + "_dk" +

@@ -107,7 +107,7 @@ void PagedDecodeAttention::eval_gpu(
   int batch = q.shape(0);
   std::string tname = dtype_to_str(q);
 
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = mx::metal::get_command_encoder(s);
   auto lib = d.get_library("mlx_serve_kernel", util::current_binary_dir());
 
   // Allocate intermediate buffers
@@ -180,8 +180,8 @@ void PagedDecodeAttention::eval_gpu(
   }
 
   // Free intermediate buffers
-  d.add_temporary(att_out, s.index);
-  d.add_temporary(att_lse, s.index);
+  compute_encoder.add_temporary(att_out);
+  compute_encoder.add_temporary(att_lse);
 }
 
 #endif
