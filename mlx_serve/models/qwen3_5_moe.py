@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from mlx_serve.core import Batch
@@ -129,11 +129,41 @@ class Qwen3_5MoeModel(nn.Module):
 
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-    def __call__(self, inputs: mx.array) -> mx.array:
+    def __call__(
+        self,
+        inputs: mx.array,
+        capture_layer_ids: Tuple[int, ...] | None = None,
+    ):
+        """Run the inner MoE decoder.
+
+        See :meth:`qwen3_5.Qwen3_5Model.__call__` for ``capture_layer_ids``
+        semantics, including the last-layer post-norm special case —
+        same behaviour here.
+        """
         h = self.embed_tokens(inputs)
-        for layer in self.layers:
+        captured: List[mx.array] = []
+        capture_set = (
+            None if not capture_layer_ids else set(capture_layer_ids)
+        )
+        last_idx = len(self.layers) - 1
+        for i, layer in enumerate(self.layers):
             h = layer(h)
-        return self.norm(h)
+            if i == last_idx:
+                h = self.norm(h)
+            if capture_set is not None and i in capture_set:
+                captured.append(h)
+        if capture_layer_ids is None:
+            return h
+        assert len(captured) == len(set(capture_layer_ids)), (
+            f"capture_layer_ids contains duplicates: {capture_layer_ids}"
+        )
+        order_map = {
+            lid: pos for pos, lid in enumerate(sorted(set(capture_layer_ids)))
+        }
+        captured_in_order = [
+            captured[order_map[lid]] for lid in capture_layer_ids
+        ]
+        return h, captured_in_order
 
 
 class Model(nn.Module):
@@ -145,22 +175,28 @@ class Model(nn.Module):
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, return_hidden: bool = False):
+    def __call__(
+        self,
+        capture_layer_ids: Tuple[int, ...] | None = None,
+    ):
         """Run the target model on the active batch's input_ids.
 
-        Args:
-            return_hidden: When ``True``, return a ``(hidden, logits)``
-                tuple where ``hidden`` is the post-norm hidden state
-                fed into ``lm_head``.  Needed by MTP/EAGLE engines to
-                feed target hidden states into the draft model.
+        See :meth:`mlx_serve.models.qwen3_5.Model.__call__` for the
+        full contract — same kwargs / return shapes here.
         """
-        hidden = self.model(get_global_ctx().batch.input_ids)
+        if capture_layer_ids is not None:
+            hidden, captured = self.model(
+                get_global_ctx().batch.input_ids,
+                capture_layer_ids=capture_layer_ids,
+            )
+        else:
+            hidden = self.model(get_global_ctx().batch.input_ids)
         if self.args.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(hidden)
         else:
             logits = self.lm_head(hidden)
-        if return_hidden:
-            return hidden, logits
+        if capture_layer_ids is not None:
+            return captured, logits
         return logits
 
     @property

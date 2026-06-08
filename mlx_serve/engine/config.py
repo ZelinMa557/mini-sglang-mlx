@@ -25,6 +25,19 @@ class EngineConfig:
     # Has no effect when ``mtp_model_path`` is None.
     num_mtp_step: int = 2
 
+    # ── DFlash (block-diffusion draft) ─────────────────────────────
+    # When set, :func:`create_engine` returns ``DflashEngine`` instead
+    # of the base :class:`Engine`.  ``mtp_model_path`` and
+    # ``dflash_model_path`` are mutually exclusive — only one spec
+    # method runs at a time.
+    dflash_model_path: str | None = None
+    # **Required** when ``dflash_model_path`` is set.  DFlash predicts
+    # ``block_size - 1`` draft tokens per iter (verify input length
+    # = block_size).  Pick whatever block size your draft checkpoint
+    # was trained for; smaller values trade per-iter throughput for
+    # lower acceptance variance.
+    dflash_block_size: int | None = None
+
     @cached_property
     def hf_config(self):
         return cached_load_hf_config(self.model_path)

@@ -82,7 +82,62 @@ class AttnBackend:
         v: mx.array,
         layer_id: int,
         batch: Batch,
+        *,
+        is_cross_attention: bool = False,
+        sliding_window_size: int = 0,
     ) -> mx.array:
+        """Write proposal K/V and run paged attention.
+
+        Args:
+            q / k / v: per-token query / key / value tensors
+                shaped ``[N, n_heads_or_kv, head_dim]``.
+            layer_id: which layer's KV buffer to write into.
+            batch: carries ``out_loc`` (where to write K/V) and
+                ``attn_metadata`` (the per-batch index tensors).
+            is_cross_attention: when ``True``, **drop the causal
+                upper bound within the extend window** — query at
+                extend offset ``p`` attends to every other extend
+                key, in addition to the cached prefix.  Used by
+                DFlash full-attention layers, where the masked
+                block tokens predict each other bidirectionally.
+                Has no effect on the decode path.
+            sliding_window_size: when ``> 0``, restrict each query
+                to keys whose absolute target-sequence position is
+                within ``W`` of (and ≤, when causal) the query's
+                position.  Used by DFlash sliding-attention layers
+                (``is_cross_attention=False, sliding_window_size=W``).
+                ``0`` means "no window".
+
+            The two flags are **mutually exclusive** — either drop
+            the causal upper bound (``is_cross_attention=True``) or
+            restrict the lower bound to a sliding window
+            (``sliding_window_size > 0``), but not both.  The three
+            valid combinations are:
+
+            =====================  =====================  =====================
+            is_cross_attention     sliding_window_size    mask
+            =====================  =====================  =====================
+            ``False``              ``0``                  causal (default)
+            ``True``               ``0``                  full / bidirectional
+            ``False``              ``W > 0``              causal + window
+            =====================  =====================  =====================
+
+            Passing both is rejected (the kernel is allowed to
+            assume it never happens).
+
+        ``is_cross_attention`` / ``sliding_window_size`` are forwarded
+        to :func:`mlx_serve_kernel.paged_prefill_attention` and are
+        currently rejected by the decode path (single-query decode
+        doesn't need mask variants).
+        """
+        assert sliding_window_size >= 0, (
+            f"sliding_window_size must be >= 0, got {sliding_window_size}"
+        )
+        assert not (is_cross_attention and sliding_window_size > 0), (
+            "is_cross_attention=True and sliding_window_size>0 are "
+            "mutually exclusive."
+        )
+
         metadata = batch.attn_metadata
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         k_cache = self.kvcache.k_cache(layer_id)
@@ -99,9 +154,15 @@ class AttnBackend:
                 metadata.prefix_lens,
                 sm_scale=self.sm_scale,
                 max_len_extend=metadata.max_len_extend,
+                is_cross_attention=is_cross_attention,
+                sliding_window_size=sliding_window_size,
             )
         else:
             assert isinstance(metadata, DecodeMetadata)
+            assert not is_cross_attention and sliding_window_size == 0, (
+                "is_cross_attention / sliding_window_size are only "
+                "supported on the prefill path."
+            )
             return paged_decode_attention(
                 q,
                 k_cache,
@@ -112,6 +173,30 @@ class AttnBackend:
                 sm_scale=self.sm_scale,
                 max_kv_splits=metadata.max_kv_splits,
             )
+
+    def store_kv_only(
+        self,
+        k: mx.array,
+        v: mx.array,
+        out_loc: mx.array,
+        layer_id: int,
+    ) -> None:
+        """Write K/V into the paged cache without running attention.
+
+        Used by spec engines whose draft layers need to "calibrate"
+        cached K/V from freshly-arrived target hidden states (DFlash
+        projects target hidden through each draft layer's k_proj /
+        v_proj and writes it at the matching page IDs).  Differs from
+        :meth:`forward` only in skipping the kernel call — the write
+        path is the same.
+
+        Args:
+            k: ``[N, num_kv_heads, head_dim]`` keys.
+            v: ``[N, num_kv_heads, head_dim]`` values.
+            out_loc: ``[N]`` int32 — per-token page IDs to write at.
+            layer_id: which layer's KV buffer to write into.
+        """
+        self.kvcache.store_kv(k, v, out_loc, layer_id)
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs

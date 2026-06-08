@@ -9,7 +9,6 @@ from mlx_serve.attention import AttnBackend
 from mlx_serve.core import Batch, Context, Req, set_global_ctx
 from mlx_serve.kvcache.mha_pool import MHAKVCache
 from mlx_serve.models import create_model
-from mlx_serve.models.qwen3_5_mtp import load_qwen3_5_mtp_draft_model
 from mlx_serve.utils import init_logger
 
 from .config import EngineConfig
@@ -109,13 +108,9 @@ class Engine:
         set_global_ctx(self.ctx)
         self.sampler = Sampler(self.model_meta.vocab_size)
 
+        # Spec-decoding engines (EAGLE / DFlash) set this in their own
+        # ``__init__``; the base engine never has a draft.
         self.draft_model = None
-        if config.mtp_model_path is not None:
-            logger.info("Loading MTP draft model from %s", config.mtp_model_path)
-            self.draft_model, _ = load_qwen3_5_mtp_draft_model(
-                config.mtp_model_path, self.model
-            )
-            logger.info("MTP draft model loaded and shared embed/lm_head.")
 
         self.dummy_req = Req(
             input_ids=mx.array([0], dtype=mx.int32),
@@ -128,18 +123,25 @@ class Engine:
         )
         self.page_table[self.dummy_req.table_idx, :] = self.dummy_page
 
+    def _extra_mamba_checkpoints_per_req(self, config: EngineConfig) -> int:
+        """Spec-decoding hook: extra mamba checkpoint slots per req.
+
+        The base engine reserves 2 slots per running req (main slot +
+        radix-cache buffer).  Speculative-decoding engines need extra
+        slots to checkpoint per-token state inside ``forward_verify``;
+        override this to bump the pool size accordingly (e.g. EAGLE
+        returns ``num_mtp_step``, DFlash returns ``block_size - 1``).
+        """
+        return 0
+
     def _create_mamba_pool(self, config: EngineConfig):
         from mlx_serve.kvcache.mamba_pool import MambaStateConfig, MambaStatePool
 
         conv_shapes, temporal_shapes = self.model.get_linear_state_shapes()
         num_linear_layers = len(conv_shapes)
-        # 2x running reqs is enough for normal serving (main slot + radix
-        # cache buffer).  MTP needs additional K checkpoint slots per req
-        # during the verify path (slot_ids[:, 1..K] in GDN forward_verify);
-        # bump the multiplier so we never block on checkpoint allocation.
-        multiplier = 2
-        if config.mtp_model_path is not None:
-            multiplier = config.num_mtp_step + 2
+        # 2x running reqs is enough for normal serving (main slot +
+        # radix cache buffer); spec engines bump this by ``K``.
+        multiplier = 2 + self._extra_mamba_checkpoints_per_req(config)
         num_slots = config.max_running_req * multiplier
         pool_config = MambaStateConfig(
             num_slots=num_slots,

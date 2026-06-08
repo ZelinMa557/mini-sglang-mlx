@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     from mlx_serve.core import Batch
@@ -344,11 +344,64 @@ class Qwen3_5Model(nn.Module):
 
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-    def __call__(self, inputs: mx.array) -> mx.array:
+    def __call__(
+        self,
+        inputs: mx.array,
+        capture_layer_ids: Tuple[int, ...] | None = None,
+    ):
+        """Run the inner decoder.
+
+        Args:
+            inputs: 1-D int32 token IDs of the active batch's flat
+                input window (concat across reqs).
+            capture_layer_ids: Optional layer indices (0-based, into
+                ``self.layers``) whose hidden states should also be
+                returned.  When set, returns
+                ``(final_hidden, captured_list)``; ``captured_list[k]``
+                is the hidden state captured at
+                ``self.layers[capture_layer_ids[k]]``.
+
+                **Last-layer special case** (intentional API quirk).
+                For ``i = len(self.layers) - 1`` the captured tensor
+                is the *post-norm* hidden — i.e. the same tensor that
+                goes into ``lm_head``.  For every other layer it's
+                the pre-final-norm residual stream output of that
+                layer.  This way EAGLE-style draft engines, which
+                want the LM-head input, get the right tensor simply
+                by asking for the last layer; DFlash-style engines,
+                which fan a few middle layers into ``fc``, get raw
+                residual-stream outputs as expected.
+
+                IDs must be unique; the returned list matches the
+                caller's input order (no implicit sort).
+        """
         h = self.embed_tokens(inputs)
-        for layer in self.layers:
+        captured: List[mx.array] = []
+        capture_set = (
+            None if not capture_layer_ids else set(capture_layer_ids)
+        )
+        last_idx = len(self.layers) - 1
+        for i, layer in enumerate(self.layers):
             h = layer(h)
-        return self.norm(h)
+            if i == last_idx:
+                # Apply final norm in-place so both the captured
+                # last-layer tensor and the function's return value
+                # share the same post-norm hidden (used by lm_head).
+                h = self.norm(h)
+            if capture_set is not None and i in capture_set:
+                captured.append(h)
+        if capture_layer_ids is None:
+            return h
+        assert len(captured) == len(set(capture_layer_ids)), (
+            f"capture_layer_ids contains duplicates: {capture_layer_ids}"
+        )
+        order_map = {
+            lid: pos for pos, lid in enumerate(sorted(set(capture_layer_ids)))
+        }
+        captured_in_order = [
+            captured[order_map[lid]] for lid in capture_layer_ids
+        ]
+        return h, captured_in_order
 
 
 class Model(nn.Module):
@@ -360,22 +413,36 @@ class Model(nn.Module):
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, return_hidden: bool = False):
+    def __call__(
+        self,
+        capture_layer_ids: Tuple[int, ...] | None = None,
+    ):
         """Run the target model on the active batch's input_ids.
 
         Args:
-            return_hidden: When ``True``, return a ``(hidden, logits)``
-                tuple where ``hidden`` is the post-norm hidden state
-                fed into ``lm_head``.  Needed by MTP/EAGLE engines to
-                feed target hidden states into the draft model.
+            capture_layer_ids: Optional per-layer hidden capture (see
+                :meth:`Qwen3_5Model.__call__` for details, including
+                the last-layer post-norm special case).  When set,
+                returns ``(captured_list, logits)``; otherwise just
+                ``logits``.  EAGLE-style draft engines pass
+                ``(num_layers - 1,)`` to grab the LM-head input.
+                DFlash-style engines pass several middle-layer
+                indices and concatenate the result along the
+                feature dim.
         """
-        hidden = self.model(get_global_ctx().batch.input_ids)
+        if capture_layer_ids is not None:
+            hidden, captured = self.model(
+                get_global_ctx().batch.input_ids,
+                capture_layer_ids=capture_layer_ids,
+            )
+        else:
+            hidden = self.model(get_global_ctx().batch.input_ids)
         if self.args.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(hidden)
         else:
             logits = self.lm_head(hidden)
-        if return_hidden:
-            return hidden, logits
+        if capture_layer_ids is not None:
+            return captured, logits
         return logits
 
     @property

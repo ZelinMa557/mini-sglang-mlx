@@ -43,17 +43,18 @@ class Req:
     cache_handle: BaseCacheHandle
     mamba_slot: int | None = None  # slot in MambaStatePool for hybrid models
 
-    # ── MTP / EAGLE-style speculative decoding state ──────────────────
-    # ``pending_token`` is the next-token that has been sampled but is
-    # NOT yet committed to the target's KV cache; it sits at
-    # ``input_ids[cached_len]`` and will be re-fed during the next
-    # iter's target verify step.
-    # ``pending_draft_token`` / ``pending_draft_hidden`` carry the FIRST
-    # draft prediction for the upcoming iter (produced either by the
-    # draft prefill or by the previous iter's "bonus" draft step) and
-    # the draft model's hidden state at that draft position (used as
-    # ``target_hidden_states`` proxy for the first regular draft step).
+    # ── Speculative-decoding state (used by SpecEngine subclasses) ────
+    # ``pending_token`` (all spec methods): the next-token that has
+    # been sampled by target but is NOT yet committed to the target's
+    # KV cache; it sits at ``input_ids[cached_len]`` and will be the
+    # first verify position next iter.
     pending_token: mx.array | None = None  # shape [1]
+    # EAGLE-style only:
+    # ``pending_draft_token`` / ``pending_draft_hidden`` carry the
+    # FIRST draft prediction for the upcoming iter (from prev iter's
+    # bonus calibration or the draft prefill) and the draft model's
+    # last hidden state at that draft position (used as
+    # ``target_hidden_states`` proxy for the first regular draft step).
     pending_draft_token: mx.array | None = None  # shape [1]
     pending_draft_hidden: mx.array | None = None  # shape [hidden_size]
 
