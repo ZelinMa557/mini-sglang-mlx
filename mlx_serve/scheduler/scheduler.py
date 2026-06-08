@@ -23,8 +23,8 @@ from .table import TableManager
 
 from mlx_serve.engine import (
     BatchSamplingArgs,
-    EagleMTPEngine,
     ForwardOutput,
+    SpecEngine,
     SpecForwardOutput,
     create_engine,
 )
@@ -47,15 +47,15 @@ class Scheduler(SchedulerIOMixin):
         self.engine = create_engine(config)
         super().__init__(config)
 
-        self.is_mtp = isinstance(self.engine, EagleMTPEngine)
+        self.is_spec = isinstance(self.engine, SpecEngine)
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         self.is_hybrid = self.engine.is_hybrid
         if self.is_hybrid:
             from .cache import HybridCacheManager
-            # MTP shares page IDs with the target via the mirrored draft
-            # KV cache, so the regular HybridCacheManager + radix tree
-            # works as-is — every cached page holds both target and
-            # draft K/V.
+            # Spec engines (EAGLE / DFlash) share page IDs with the
+            # target via the mirrored draft KV cache, so the regular
+            # HybridCacheManager + radix tree works as-is — every
+            # cached page holds both target and draft K/V.
             self.cache_manager = HybridCacheManager(
                 None, self.engine.num_pages, self.engine.mamba_pool,
             )
@@ -64,17 +64,17 @@ class Scheduler(SchedulerIOMixin):
                 None, self.engine.num_pages, config.cache_type,
             )
 
-        # MTP reserves K extra KV pages per running req per iter; bump
-        # ``DecodeManager.extra_per_req`` so the prefill scheduler
-        # accounts for that peak when admitting new requests.
-        extra_per_req = self.engine.K if self.is_mtp else 0  # type: ignore[attr-defined]
+        # Spec engines reserve K extra KV pages per running req per
+        # iter; bump ``DecodeManager.extra_per_req`` so the prefill
+        # scheduler accounts for that peak when admitting new reqs.
+        extra_per_req = self.engine.K if self.is_spec else 0  # type: ignore[attr-defined]
         self.decode_manager = DecodeManager(extra_per_req=extra_per_req)
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
 
-        if self.is_mtp:
-            assert isinstance(self.engine, EagleMTPEngine)
+        if self.is_spec:
+            assert isinstance(self.engine, SpecEngine)
             self.engine.set_cache_manager(self.cache_manager)
 
         self.finished_reqs: Set[Req] = set()
@@ -201,10 +201,10 @@ class Scheduler(SchedulerIOMixin):
         return forward_output
 
     # ════════════════════════════════════════════════════════════════
-    # MTP-specific output processing
+    # Spec-engine output processing (EAGLE / DFlash)
     # ════════════════════════════════════════════════════════════════
 
-    def _process_mtp_output(
+    def _process_spec_output(
         self, batch: Batch, output: SpecForwardOutput,
     ) -> None:
         """Iterate ``output.accepted_tokens`` per req, handling EOS / max_tokens.
@@ -225,11 +225,12 @@ class Scheduler(SchedulerIOMixin):
 
             accepted_list: List[int] = output.accepted_tokens[i].tolist()
 
-            # MTP can over-commit by up to K tokens in a single iter
-            # (verify accepted more than ``max_tokens - generated_so_far``).
-            # Truncate the user-visible report so total generated tokens
-            # never exceed ``max_tokens``.  Internal req state may still
-            # carry the extras; they get freed on req cleanup.
+            # Spec engines can over-commit by up to K tokens in a single
+            # iter (verify accepted more than ``max_tokens -
+            # generated_so_far``).  Truncate the user-visible report so
+            # total generated tokens never exceed ``max_tokens``.
+            # Internal req state may still carry the extras; they get
+            # freed on req cleanup.
             overshoot = max(0, req.device_len - req.max_device_len)
             if overshoot >= len(accepted_list):
                 accepted_list = []
@@ -300,12 +301,12 @@ class Scheduler(SchedulerIOMixin):
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
 
-        if self.is_mtp:
-            self._mtp_loop_step()
+        if self.is_spec:
+            self._spec_loop_step()
         else:
-            self._non_mtp_loop_step()
+            self._non_spec_loop_step()
 
-    def _non_mtp_loop_step(self) -> None:
+    def _non_spec_loop_step(self) -> None:
         forward_input = self._schedule_next_batch()
         ongoing_data = None
         if forward_input is not None:
@@ -313,8 +314,8 @@ class Scheduler(SchedulerIOMixin):
 
         self._process_last_data(ongoing_data)
 
-    def _mtp_loop_step(self) -> None:
-        assert isinstance(self.engine, EagleMTPEngine)
+    def _spec_loop_step(self) -> None:
+        assert isinstance(self.engine, SpecEngine)
         batch = self._select_batch()
         if batch is None:
             return
@@ -322,7 +323,7 @@ class Scheduler(SchedulerIOMixin):
         # and returns variable-length accepted tokens per req.
         spec_output = self.engine.run_iter(batch)
         self.decode_manager.filter_reqs(batch.reqs)
-        self._process_mtp_output(batch, spec_output)
+        self._process_spec_output(batch, spec_output)
 
     def run_forever(self) -> NoReturn:
         while True:

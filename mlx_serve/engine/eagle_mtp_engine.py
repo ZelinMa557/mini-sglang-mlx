@@ -62,46 +62,21 @@ Limitations (intentional first cut):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Tuple
+from typing import List, Tuple
 
 import mlx.core as mx
 
 from mlx_serve.attention import AttnBackend
 from mlx_serve.core import Batch, BatchPhase, Context, Req, use_ctx
 from mlx_serve.kvcache.mha_pool import MHAKVCache
+from mlx_serve.models.qwen3_5_mtp import load_qwen3_5_mtp_draft_model
 from mlx_serve.utils import init_logger
 
 from .config import EngineConfig
-from .engine import Engine
+from .spec_engine import SpecEngine, SpecForwardOutput
 from .spec_sample import GreedyVerifyResult, greedy_verify
 
-if TYPE_CHECKING:
-    from mlx_serve.scheduler.cache import CacheManager
-
 logger = init_logger(__name__)
-
-
-# ════════════════════════════════════════════════════════════════════
-# Output container
-# ════════════════════════════════════════════════════════════════════
-
-
-@dataclass
-class SpecForwardOutput:
-    """Per-iter MTP output handed back to the scheduler.
-
-    ``accepted_tokens`` is a list of length ``B``; entry ``i`` is the
-    1-D int32 array of NEW tokens committed for req ``i`` this iter.
-
-    * Prefill: ``[T_1]`` (length 1).
-    * Decode:  ``[D_1, ..., D_j, bonus]`` (length ``j+1``, with
-      ``j = num_drafts_accepted``).  These are the tokens NOT already
-      present in ``req.input_ids`` before the iter — they are appended
-      to ``req.input_ids`` by the engine before returning.
-    """
-
-    accepted_tokens: List[mx.array]
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -109,12 +84,15 @@ class SpecForwardOutput:
 # ════════════════════════════════════════════════════════════════════
 
 
-class EagleMTPEngine(Engine):
-    """EAGLE-style MTP engine over the base :class:`Engine` skeleton.
+class EagleMTPEngine(SpecEngine):
+    """EAGLE-style MTP engine over :class:`SpecEngine`.
 
-    The base class loads the target + (optional) draft model and the
-    target's MHA / Mamba pools.  This subclass additionally owns:
+    Shared infrastructure (target model + KV / Mamba pools, per-iter
+    slab allocation + verify metadata builders + resource release)
+    lives on the base class.  This subclass additionally owns:
 
+    * the Qwen3.5 MTP single-layer draft model (loaded here, shares
+      ``embed_tokens`` / ``lm_head`` with the target).
     * a 1-layer MHA KV cache for the draft, with the SAME ``num_pages``
       as the target so page IDs are usable interchangeably between
       both KV buffers (mirrored layout).
@@ -126,15 +104,21 @@ class EagleMTPEngine(Engine):
     """
 
     def __init__(self, config: EngineConfig):
-        super().__init__(config)
-        assert self.draft_model is not None, (
-            "EagleMTPEngine requires a draft model; "
-            "set EngineConfig.mtp_model_path."
+        assert config.mtp_model_path is not None, (
+            "EagleMTPEngine requires EngineConfig.mtp_model_path"
         )
         assert config.num_mtp_step >= 1, (
             f"num_mtp_step must be >= 1, got {config.num_mtp_step}"
         )
+        super().__init__(config)
         self.K = config.num_mtp_step
+
+        # Load the MTP draft (shares embed_tokens / lm_head with target).
+        logger.info("Loading MTP draft model from %s", config.mtp_model_path)
+        self.draft_model, _ = load_qwen3_5_mtp_draft_model(
+            config.mtp_model_path, self.model
+        )
+        logger.info("MTP draft model loaded and shared embed/lm_head.")
 
         # Draft KV cache: mirrors the target's page layout.  Same
         # ``num_pages`` so any target-side page ID is also a valid
@@ -165,33 +149,17 @@ class EagleMTPEngine(Engine):
             gdn_backend=None,
         )
 
-        # Injected by the scheduler so the engine can alloc/free target
-        # KV pages without bouncing through the scheduler on every
-        # sub-forward.
-        self._cache_manager: "CacheManager | None" = None
-
-    def set_cache_manager(self, cache_manager: "CacheManager") -> None:
-        self._cache_manager = cache_manager
-
-    @property
-    def cache_manager(self) -> "CacheManager":
-        assert self._cache_manager is not None, (
-            "EagleMTPEngine.cache_manager not set. "
-            "Call set_cache_manager(...) after constructing the engine."
+        # The MTP draft consumes the target's LAST hidden as
+        # ``target_hidden_states`` (the same tensor that goes into
+        # the target's lm_head).  We capture it via the post-norm
+        # special-case of :meth:`Qwen3_5Model.__call__`.
+        self._target_capture_layer_ids: Tuple[int, ...] = (
+            len(self.model.layers) - 1,
         )
-        return self._cache_manager
 
-    # ════════════════════════════════════════════════════════════════
-    # Public entry point — called once per scheduled batch
-    # ════════════════════════════════════════════════════════════════
-
-    def run_iter(self, batch: Batch) -> SpecForwardOutput:
-        """Drive one MTP iter (prefill OR decode)."""
-        if batch.is_prefill:
-            return self._run_prefill(batch)
-        if batch.is_decode:
-            return self._run_decode_iter(batch)
-        raise ValueError(f"Unsupported phase for EagleMTPEngine: {batch.phase}")
+    def _extra_mamba_checkpoints_per_req(self, config: EngineConfig) -> int:
+        # Target verify checkpoints ``K`` extra states per req.
+        return config.num_mtp_step
 
     # ════════════════════════════════════════════════════════════════
     # Prefill: target prefill → sample T_1 → shifted draft prefill
@@ -219,7 +187,9 @@ class EagleMTPEngine(Engine):
         # only the NEW positions and we get target_hidden for those.
         self._prepare_target_prefill_inplace(batch)
         with self.ctx.forward_batch(batch):
-            target_hidden, target_logits = self.model(return_hidden=True)
+            (target_hidden,), target_logits = self.model(
+                capture_layer_ids=self._target_capture_layer_ids,
+            )
 
         # 2. Sample T_1 per req at the last prompt position.
         last_indices = batch.attn_metadata.get_last_indices(B)
@@ -285,13 +255,8 @@ class EagleMTPEngine(Engine):
         # (K-1 regular forwards write slabs[:, 0..K-2]; calibration
         # prefill writes slabs[:, 0..j_i] where j_i ≤ K).  Slot i of
         # slab[r] simultaneously addresses target_kv_cache and
-        # draft_kv_cache via the mirrored page layout — page_table is
-        # stamped once here for both consumers.
-        flat_pages = self.cache_manager.allocate(B * verify_len)
-        slabs = flat_pages.reshape(B, verify_len)
-        for i, r in enumerate(reqs):
-            c = r.cached_len
-            self.page_table[r.table_idx, c : c + verify_len] = slabs[i]
+        # draft_kv_cache via the mirrored page layout.
+        flat_pages, slabs = self._allocate_iter_slabs(reqs)
 
         # ---- Gather pending state from prev iter ---------------------
         # ``stack(...).squeeze(-1)`` collapses a list of [1]-shape
@@ -333,11 +298,13 @@ class EagleMTPEngine(Engine):
         ).reshape(-1)  # [B*(K+1)]
         verify_batch, slot_ids_rows, new_mamba_slots = (
             self._build_target_verify_batch(
-                reqs, verify_input_ids, K, flat_pages,
+                reqs, verify_input_ids, flat_pages,
             )
         )
         with self.ctx.forward_batch(verify_batch):
-            verify_hidden_flat, verify_logits_flat = self.model(return_hidden=True)
+            (verify_hidden_flat,), verify_logits_flat = self.model(
+                capture_layer_ids=self._target_capture_layer_ids,
+            )
         D = verify_hidden_flat.shape[-1]
         V = verify_logits_flat.shape[-1]
         verify_hidden = verify_hidden_flat.reshape(B, verify_len, D)
@@ -404,89 +371,10 @@ class EagleMTPEngine(Engine):
             accepted.append(tail)
         return SpecForwardOutput(accepted_tokens=accepted)
 
-    def _release_iter_resources(
-        self,
-        reqs: List[Req],
-        num_accepted_host: List[int],
-        slabs: mx.array,
-        slot_ids_rows: List[List[int]],
-        new_mamba_slots: List[int],
-    ) -> None:
-        """Free per-iter mamba checkpoint slots + unused KV pages.
-
-        Must be called AFTER both verify and the draft calibration
-        prefill, since both passes still read from these resources.
-        Per req ``i`` (``j_i = num_drafts_accepted``):
-
-        * **Mamba** (hybrid only).  ``slot_ids[i, 0]`` was the req's
-          main slot before this iter; verify clobbered it with "state
-          after T". The correct post-iter state lives in
-          ``slot_ids[i, j_i]`` ("state after the last accepted token"),
-          which we copy back to the main slot.  All ``B*K`` new
-          checkpoint slots are then returned to the pool.
-        * **KV pages**.  Keep ``slabs[i, 0..j_i]`` (``j_i+1`` pages =
-          the accepted prefix, shared by target and draft via the
-          mirrored layout); free ``slabs[i, j_i+1..K]`` (``K-j_i``
-          pages, both target and draft K/V reclaimed together).
-        """
-        K = self.K
-        if self.is_hybrid:
-            src_slots: List[int] = []
-            dst_slots: List[int] = []
-            for i, r in enumerate(reqs):
-                j = num_accepted_host[i]
-                if j >= 1:
-                    src_slots.append(slot_ids_rows[i][j])
-                    dst_slots.append(r.mamba_slot)  # type: ignore[arg-type]
-            if src_slots:
-                assert self.mamba_pool is not None
-                self.mamba_pool.copy_batched(
-                    mx.array(src_slots, dtype=mx.int32),
-                    mx.array(dst_slots, dtype=mx.int32),
-                )
-            assert self.mamba_pool is not None
-            self.mamba_pool.free_many(new_mamba_slots)
-
-        free_chunks: List[mx.array] = []
-        for i, j in enumerate(num_accepted_host):
-            if K - j > 0:
-                free_chunks.append(slabs[i, j + 1 :])
-        if free_chunks:
-            self.cache_manager._free(mx.concatenate(free_chunks))
-
     # ════════════════════════════════════════════════════════════════
-    # Batch / metadata builders
+    # Batch / metadata builders (MTP-specific; shared helpers live
+    # in :class:`SpecEngine`).
     # ════════════════════════════════════════════════════════════════
-
-    def _prepare_target_prefill_inplace(self, batch: Batch) -> None:
-        """In-place setup of a target prefill batch.
-
-        Mirrors what :meth:`Scheduler._prepare_batch` would do for the
-        non-MTP engine.  Allocates target pages, writes page_table,
-        concatenates input_ids and builds attn / mamba metadata.
-        """
-        reqs = batch.reqs
-        needed = sum(r.extend_len for r in reqs)
-        out_loc = self.cache_manager.allocate(needed)
-        batch.out_loc = out_loc
-        batch.padded_reqs = reqs
-
-        offset = 0
-        chunks: List[mx.array] = []
-        for req in reqs:
-            n = req.extend_len
-            if n > 0:
-                self.page_table[
-                    req.table_idx, req.cached_len : req.device_len
-                ] = out_loc[offset : offset + n]
-                chunks.append(req.input_ids[req.cached_len : req.device_len])
-                offset += n
-        batch.input_ids = (
-            mx.concatenate(chunks) if chunks else mx.array([], dtype=mx.int32)
-        )
-        self.attn_backend.prepare_metadata(batch)
-        if self.gdn_backend is not None:
-            self.gdn_backend.prepare_batch(batch)
 
     def _build_draft_prefill_input_ids(
         self, reqs: List[Req], T_batch: mx.array,
@@ -634,62 +522,3 @@ class EagleMTPEngine(Engine):
         batch.padded_reqs = reqs
         batch.attn_metadata = metadata
         return batch, input_ids, target_hidden
-
-    def _build_target_verify_batch(
-        self,
-        reqs: List[Req],
-        verify_input_ids: mx.array,
-        K: int,
-        out_loc: mx.array,
-    ) -> Tuple[Batch, List[List[int]], List[int]]:
-        """Target verify batch with ``extend_len = K+1`` per req.
-
-        ``out_loc`` is the pre-allocated, flattened ``[B*(K+1)]`` page
-        IDs; the caller has already stamped them into the per-req
-        page_table slices.
-
-        Returns
-            (batch, slot_ids_rows, new_mamba_slots)
-
-        ``slot_ids_rows`` is the host-side list-of-lists mirror of
-        ``batch.mamba_slot_ids`` (used to compute per-req rollback
-        sources without an extra GPU→CPU sync).
-        ``new_mamba_slots`` is the flat list of ``B*K`` checkpoint
-        slots allocated this iter (freed in the caller after rollback).
-        """
-        B = len(reqs)
-        verify_len = K + 1
-
-        # ``extend_len`` per req is K+1, NOT req.extend_len — the target
-        # evaluates ``[T, D_1, ..., D_K]`` over K+1 fresh positions.
-        extend_lens = [verify_len] * B
-        kv_lens = [r.cached_len + verify_len for r in reqs]
-        metadata = self.attn_backend.build_prefill_metadata(
-            reqs, extend_lens=extend_lens, kv_lens=kv_lens,
-        )
-
-        batch = Batch(reqs=reqs, phase=BatchPhase.TARGET_VERIFY)
-        batch.input_ids = verify_input_ids
-        batch.out_loc = out_loc
-        batch.padded_reqs = reqs
-        batch.attn_metadata = metadata
-
-        slot_ids_rows: List[List[int]] = []
-        new_mamba_slots: List[int] = []
-        if self.is_hybrid:
-            assert self.mamba_pool is not None
-            allocated = self.mamba_pool.alloc_many(B * K)
-            if allocated is None:
-                raise RuntimeError(
-                    f"Out of mamba checkpoint slots: needed {B * K}, "
-                    f"have {self.mamba_pool.available_size}"
-                )
-            new_mamba_slots = allocated
-            slot_ids_rows = [
-                [r.mamba_slot] + new_mamba_slots[i * K : (i + 1) * K]  # type: ignore[list-item]
-                for i, r in enumerate(reqs)
-            ]
-            batch.mamba_slot_ids = mx.array(slot_ids_rows, dtype=mx.int32)
-            # No mamba_prefill_indptr needed for the verify path.
-
-        return batch, slot_ids_rows, new_mamba_slots
