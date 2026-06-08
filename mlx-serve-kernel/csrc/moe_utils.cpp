@@ -116,7 +116,7 @@ void MoeSumReduce::eval_gpu(
   auto lib = d.get_library("mlx_serve_kernel", util::current_binary_dir());
   auto kernel = d.get_kernel(op_name, lib);
   
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = mx::metal::get_command_encoder(s);
   out.set_data(mx::allocator::malloc(out.nbytes()));
   
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -167,7 +167,7 @@ void MoeSumReduceWithReorder::eval_gpu(
   auto lib = d.get_library("mlx_serve_kernel", util::current_binary_dir());
   auto kernel = d.get_kernel(op_name, lib);
   
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = mx::metal::get_command_encoder(s);
   out.set_data(mx::allocator::malloc(out.nbytes()));
   
   compute_encoder.set_compute_pipeline_state(kernel);

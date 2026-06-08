@@ -2,7 +2,7 @@
 requires = [
   "setuptools>=42",
   "cmake>=3.25",
-  "mlx==0.30.6",
-  "nanobind==2.10.2",
+  "mlx>=0.31.2",
+  "nanobind==2.12.0",
 ]
 build-backend = "setuptools.build_meta"

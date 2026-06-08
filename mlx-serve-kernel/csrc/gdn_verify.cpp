@@ -8,6 +8,7 @@
 
 #ifdef _METAL_
 #include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/utils.h"
 #endif
 
 namespace mlx_serve {
@@ -130,7 +131,7 @@ void GDNStateVerify::eval_gpu(
 
   auto lib = d.get_library("mlx_serve_kernel", util::current_binary_dir());
   auto kernel = d.get_kernel("gdn_state_verify_float32_dk128_dv128", lib);
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = mx::metal::get_command_encoder(s);
 
   const uint32_t batch_u = static_cast<uint32_t>(slot_ids.shape(0));
   const uint32_t num_draft_u = static_cast<uint32_t>(slot_ids.shape(1));
