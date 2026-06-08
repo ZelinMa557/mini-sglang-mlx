@@ -108,38 +108,36 @@ class DflashEngine(SpecEngine):
     """
 
     def __init__(self, config: EngineConfig):
-        assert config.dflash_model_path is not None, (
-            "DflashEngine requires EngineConfig.dflash_model_path."
+        assert config.spec_algo == "dflash", (
+            f"DflashEngine requires spec_algo='dflash', got {config.spec_algo!r}"
         )
-        assert config.mtp_model_path is None, (
-            "mtp_model_path and dflash_model_path are mutually exclusive."
+        assert config.draft_path is not None, (
+            "DflashEngine requires EngineConfig.draft_path."
         )
-        assert (
-            config.dflash_block_size is not None
-            and config.dflash_block_size >= 2
-        ), (
-            f"DflashEngine requires EngineConfig.dflash_block_size >= 2 "
-            f"(got {config.dflash_block_size}); set it to the block size "
+        assert config.num_draft_tokens >= 1, (
+            f"DflashEngine requires num_draft_tokens >= 1, got "
+            f"{config.num_draft_tokens}; this is the block_size - 1 "
             f"the draft checkpoint was trained with."
         )
 
         # Stash block_size BEFORE the base engine's __init__ runs so
         # the mamba pool sizing has K available (Engine.__init__ →
         # _create_mamba_pool → our _extra_mamba_checkpoints_per_req).
-        self._block_size: int = config.dflash_block_size
+        # block_size = K + 1: slot 0 of the block is the already-known
+        # pending token T, slots 1..K are the masked positions the
+        # draft fills in.
+        self._block_size: int = config.num_draft_tokens + 1
 
         super().__init__(config)
 
-        # K = drafts per iter (= block_size - 1; slot 0 of the
-        # block is the already-known pending token T).
-        self.K: int = self._block_size - 1
+        self.K: int = config.num_draft_tokens
 
         # ---- Load draft model + bind shared weights ------------------
         logger.info(
-            "Loading DFlash draft model from %s", config.dflash_model_path,
+            "Loading DFlash draft model from %s", config.draft_path,
         )
         self.draft_model = load_dflash_draft_model(
-            config.dflash_model_path, self.model,
+            config.draft_path, self.model,
         )
         self.draft_config = self.draft_model.args
         logger.info(

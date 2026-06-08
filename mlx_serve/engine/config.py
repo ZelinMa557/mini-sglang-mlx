@@ -2,13 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING
 
 import mlx.core as mx
 from mlx_serve.utils import cached_load_hf_config
 
 if TYPE_CHECKING:
     from mlx_serve.models import ModelConfig
+
+
+# Valid values for :attr:`EngineConfig.spec_algo`.  Kept lowercase
+# internally; the CLI also accepts the conventional capitalisations
+# ("MTP", "DFlash") and normalises before constructing the config.
+SPEC_ALGOS = ("mtp", "dflash")
 
 
 @dataclass(frozen=True)
@@ -20,23 +26,60 @@ class EngineConfig:
     page_size: int = 1
     kv_cache_gb: float | None = None
     max_seq_len_override: int | None = None
-    mtp_model_path: str | None = None
-    # Number of draft tokens per MTP iter (K). Verify input length is K+1.
-    # Has no effect when ``mtp_model_path`` is None.
-    num_mtp_step: int = 2
 
-    # ── DFlash (block-diffusion draft) ─────────────────────────────
-    # When set, :func:`create_engine` returns ``DflashEngine`` instead
-    # of the base :class:`Engine`.  ``mtp_model_path`` and
-    # ``dflash_model_path`` are mutually exclusive — only one spec
-    # method runs at a time.
-    dflash_model_path: str | None = None
-    # **Required** when ``dflash_model_path`` is set.  DFlash predicts
-    # ``block_size - 1`` draft tokens per iter (verify input length
-    # = block_size).  Pick whatever block size your draft checkpoint
-    # was trained for; smaller values trade per-iter throughput for
-    # lower acceptance variance.
-    dflash_block_size: int | None = None
+    # ── Speculative decoding (unified) ──────────────────────────────
+    # ``spec_algo`` selects the algorithm; the other two fields
+    # configure it.  Both MTP and DFlash share the same
+    # ``draft_path`` / ``num_draft_tokens`` knobs:
+    #
+    # * ``spec_algo="mtp"``:   ``draft_path`` is a single MTP
+    #   ``.safetensors`` file (or a directory containing one); the
+    #   draft itself is a single full-attention layer that shares
+    #   ``embed_tokens`` / ``lm_head`` with the target.
+    #   ``num_draft_tokens = K`` = the number of drafts per iter.
+    #
+    # * ``spec_algo="dflash"``: ``draft_path`` is a model directory
+    #   (or remote repo ID) for a block-diffusion DFlash draft.
+    #   ``num_draft_tokens = K``; the draft block size at runtime
+    #   is ``K + 1`` (verify input length per req = K + 1).
+    #
+    # ``spec_algo=None`` (default) → no speculative decoding; the
+    # other two fields are ignored.
+    spec_algo: str | None = None
+    draft_path: str | None = None
+    num_draft_tokens: int = 0
+
+    # ── Mamba state pool sizing (manual override) ───────────────────
+    # When set, ``Engine._create_mamba_pool`` uses this exact slot
+    # count instead of computing one from ``max_running_req`` and
+    # the spec method's per-req checkpoint footprint.  Useful for
+    # hybrid models (Qwen3.5) where the default heuristic may
+    # over- or under-allocate; this knob is exposed for didactic
+    # purposes (the project is meant to be a teaching codebase).
+    num_mamba_slots: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.spec_algo is not None:
+            if self.spec_algo not in SPEC_ALGOS:
+                raise ValueError(
+                    f"spec_algo must be one of {SPEC_ALGOS} or None, "
+                    f"got {self.spec_algo!r}"
+                )
+            if self.draft_path is None:
+                raise ValueError(
+                    f"spec_algo={self.spec_algo!r} requires draft_path"
+                )
+            if self.num_draft_tokens < 1:
+                raise ValueError(
+                    f"spec_algo={self.spec_algo!r} requires "
+                    f"num_draft_tokens >= 1, got {self.num_draft_tokens}"
+                )
+        if self.num_mamba_slots is not None and self.num_mamba_slots < self.max_running_req:
+            raise ValueError(
+                f"num_mamba_slots ({self.num_mamba_slots}) must be >= "
+                f"max_running_req ({self.max_running_req}) so every "
+                "in-flight req has at least its own main slot."
+            )
 
     @cached_property
     def hf_config(self):

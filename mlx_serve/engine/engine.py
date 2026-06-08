@@ -129,8 +129,9 @@ class Engine:
         The base engine reserves 2 slots per running req (main slot +
         radix-cache buffer).  Speculative-decoding engines need extra
         slots to checkpoint per-token state inside ``forward_verify``;
-        override this to bump the pool size accordingly (e.g. EAGLE
-        returns ``num_mtp_step``, DFlash returns ``block_size - 1``).
+        override this to bump the pool size accordingly — both EAGLE
+        and DFlash return ``num_draft_tokens`` (= K = block_size - 1
+        for DFlash).
         """
         return 0
 
@@ -139,10 +140,26 @@ class Engine:
 
         conv_shapes, temporal_shapes = self.model.get_linear_state_shapes()
         num_linear_layers = len(conv_shapes)
-        # 2x running reqs is enough for normal serving (main slot +
-        # radix cache buffer); spec engines bump this by ``K``.
-        multiplier = 2 + self._extra_mamba_checkpoints_per_req(config)
-        num_slots = config.max_running_req * multiplier
+        # Default heuristic: 2x running reqs is enough for normal
+        # serving (main slot + radix cache buffer); spec engines bump
+        # this by ``K`` (extra per-token verify checkpoints).  When
+        # ``config.num_mamba_slots`` is set we honour it verbatim —
+        # the project is meant to be a teaching codebase, so let the
+        # user own this knob if they want to experiment.
+        if config.num_mamba_slots is not None:
+            num_slots = config.num_mamba_slots
+            logger.info(
+                "Using explicit num_mamba_slots=%d (override)", num_slots,
+            )
+        else:
+            multiplier = 2 + self._extra_mamba_checkpoints_per_req(config)
+            num_slots = config.max_running_req * multiplier
+            logger.info(
+                "Auto-sizing mamba pool: num_slots=%d "
+                "(= max_running_req * (2 + %d extra))",
+                num_slots,
+                self._extra_mamba_checkpoints_per_req(config),
+            )
         pool_config = MambaStateConfig(
             num_slots=num_slots,
             num_layers=num_linear_layers,
