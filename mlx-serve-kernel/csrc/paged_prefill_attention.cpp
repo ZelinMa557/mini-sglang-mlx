@@ -21,6 +21,8 @@ mx::array paged_prefill_attention(
     const mx::array& prefix_lens,
     float sm_scale,
     int max_len_extend,
+    bool is_cross_attention,
+    int sliding_window_size,
     mx::StreamOrDevice s_) {
   if (q.ndim() != 3) {
     throw std::runtime_error(
@@ -57,6 +59,10 @@ mx::array paged_prefill_attention(
     throw std::runtime_error(
         "paged_prefill_attention: cache head_dim must match q head_dim");
   }
+  if (sliding_window_size < 0) {
+    throw std::runtime_error(
+        "paged_prefill_attention: sliding_window_size must be >= 0");
+  }
 
   // batch = qo_indptr.size - 1
   int batch = qo_indptr.shape(0) - 1;
@@ -72,7 +78,7 @@ mx::array paged_prefill_attention(
       q.dtype(),
       std::make_shared<PagedPrefillAttention>(
           s, sm_scale, max_len_extend, num_q_heads, num_kv_heads,
-          head_dim, total_q_tokens),
+          head_dim, total_q_tokens, is_cross_attention, sliding_window_size),
       {q, k_cache, v_cache, qo_indptr, kv_indptr, kv_indices, prefix_lens});
 }
 
@@ -135,6 +141,8 @@ void PagedPrefillAttention::eval_gpu(
   compute_encoder.set_bytes(sm_scale_, 8);
   compute_encoder.set_bytes(num_q_heads_, 9);
   compute_encoder.set_bytes(num_kv_heads_, 10);
+  compute_encoder.set_bytes(is_cross_attention_, 11);
+  compute_encoder.set_bytes(sliding_window_size_, 12);
 
   constexpr int BLOCK_M = 64;
   int num_q_blocks = (max_len_extend_ + BLOCK_M - 1) / BLOCK_M;
