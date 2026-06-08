@@ -377,6 +377,7 @@ class DflashEngine(SpecEngine):
         num_accepted_host: List[int] = result.num_drafts_accepted.tolist()
         bonus_host: List[int] = result.bonus_tokens.tolist()
         drafts_host: List[List[int]] = drafts.tolist()
+        self._log_acceptance(num_accepted_host)
 
         # ---- Calibrate draft for the accepted positions -------------
         # Per req i with ``j_i = num_accepted``: write per-layer
