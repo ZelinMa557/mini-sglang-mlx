@@ -217,7 +217,9 @@ METAL_FUNC void exp2_sub_frag(
     thread metal::vec<T, kElemRows>& row_max) {
   for (short i = 0; i < kElemRows; ++i) {
     for (short j = 0; j < kElemCols; ++j) {
-      frag[i * kElemCols + j] = fast::exp2(frag[i * kElemCols + j] - row_max[i]);
+      frag[i * kElemCols + j] = (row_max[i] == -HUGE_VALF)
+        ? T(0)
+        : fast::exp2(frag[i * kElemCols + j] - row_max[i]);
     }
   }
 }
@@ -429,7 +431,9 @@ template <typename T, short DK, short DV, short BLOCK_H>
     metal::vec<float, kRowsPT> factor;
     for (short i = 0; i < kRowsPT; ++i) {
       if (row_active[i]) {
-        factor[i] = fast::exp2(max_score[i] - new_max[i]);
+        factor[i] = (new_max[i] == -HUGE_VALF)
+          ? 1.0f
+          : fast::exp2(max_score[i] - new_max[i]);
         max_score[i] = new_max[i];
         sum_score[i] *= factor[i];
       } else {

@@ -1,4 +1,5 @@
 #include "paged_prefill_attention.h"
+#include "jit_library.h"
 #include "util.h"
 
 #include "mlx/backend/common/utils.h"
@@ -10,6 +11,9 @@
 #endif
 
 namespace mlx_serve {
+
+#ifdef _METAL_
+#endif
 
 mx::array paged_prefill_attention(
     const mx::array& q,
@@ -120,7 +124,8 @@ void PagedPrefillAttention::eval_gpu(
   std::string tname = dtype_to_str(q);
 
   auto& compute_encoder = mx::metal::get_command_encoder(s);
-  auto lib = d.get_library("mlx_serve_kernel", util::current_binary_dir());
+  auto lib = get_jit_library(
+      d, "mlx_serve_kernel_prefill", jit::paged_prefill_attention_metal_source);
 
   std::string kernel_name = "paged_prefill_attention_" + tname + "_dk" +
                             std::to_string(head_dim_) + "_dv" +

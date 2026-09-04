@@ -6,12 +6,12 @@ using namespace metal;
 
 namespace {
 
-constant short kFragRows = 16;
-constant short kFragCols = 16;
-constant short kElemsPerFrag = (kFragRows * kFragCols) / 32;
-constant short kElemRows = 2;
-constant short kElemCols = 4;
-constant short kElemRowsJump = 8;
+constant constexpr short kFragRows = 16;
+constant constexpr short kFragCols = 16;
+constant constexpr short kElemsPerFrag = (kFragRows * kFragCols) / 32;
+constant constexpr short kElemRows = 2;
+constant constexpr short kElemCols = 4;
+constant constexpr short kElemRowsJump = 8;
 
 template <typename T>
 using FragVec = metal::vec<T, 8>;
@@ -363,7 +363,11 @@ METAL_FUNC void exp_sub_frag(
   for (short i = 0; i < kElemRows; ++i) {
     for (short j = 0; j < kElemCols; ++j) {
       const short idx = i * kElemCols + j;
-      frag[idx] = fast::exp2(frag[idx] - row_max[i]);
+      // A fully masked block has row_max == -inf; -inf - (-inf) is NaN,
+      // while the correct probability contribution is 0.
+      frag[idx] = (row_max[i] == -HUGE_VALF)
+          ? T(0)
+          : fast::exp2(frag[idx] - row_max[i]);
     }
   }
 }
@@ -539,7 +543,12 @@ template <
 
     metal::vec<float, kRowsPT> factor;
     for (short i = 0; i < kRowsPT; ++i) {
-      factor[i] = fast::exp2(max_score[i] - new_max[i]);
+      // If the block is fully masked (new_max == -inf), -inf - (-inf) would
+      // be NaN; the old accumulator correctly contributes nothing, so keep
+      // the factor at 1 (both sum and O stay 0/-inf).
+      factor[i] = (new_max[i] == -HUGE_VALF)
+          ? 1.0f
+          : fast::exp2(max_score[i] - new_max[i]);
       max_score[i] = new_max[i];
       sum_score[i] *= factor[i];
     }
