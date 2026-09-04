@@ -52,8 +52,8 @@ file(
   GLOB KERNEL_METAL_SOURCES CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_LIST_DIR}/csrc/*.metal")
 
-# Build metallib
 if(MLX_BUILD_METAL)
+  # Build metallib for kernels without MPP cooperative tensors.
   mlx_build_metallib(
     TARGET
     mlx_ext_metallib
@@ -69,6 +69,31 @@ if(MLX_BUILD_METAL)
 
   add_dependencies(mlx_serve_kernel mlx_ext_metallib)
 
+  # The MPP cooperative tensor layout depends on the Metal language version
+  # used at compile time. Offline `xcrun metal` compilation produces a
+  # layout that does not match the MPP runtime on this OS/Xcode, which
+  # corrupts the MMA operand placement. Compiling the kernel sources at
+  # runtime via MTL::newLibrary with MTL::LanguageVersion4_0 (the same
+  # path MLX uses for its own kernels) produces the correct layout.
+  # Generate an embedded copy of the sources for runtime JIT compilation.
+  set(JIT_SOURCE_CPP "${CMAKE_CURRENT_BINARY_DIR}/jit_sources.cpp")
+  add_custom_command(
+    OUTPUT ${JIT_SOURCE_CPP}
+    COMMAND
+      ${Python_EXECUTABLE} "${CMAKE_CURRENT_LIST_DIR}/tools/gen_jit_source.py"
+      ${JIT_SOURCE_CPP}
+      "${CMAKE_CURRENT_LIST_DIR}/csrc/mlx_metal_utils_min.h"
+      ${KERNEL_METAL_SOURCES}
+    DEPENDS
+      ${CMAKE_CURRENT_LIST_DIR}/tools/gen_jit_source.py
+      ${CMAKE_CURRENT_LIST_DIR}/csrc/mlx_metal_utils_min.h
+      ${KERNEL_METAL_SOURCES}
+    COMMAND_EXPAND_LISTS
+    VERBATIM
+    COMMENT "Generating embedded metal sources for runtime JIT")
+  add_custom_target(mlx_serve_kernel_jit_sources DEPENDS ${JIT_SOURCE_CPP})
+  add_dependencies(mlx_serve_kernel mlx_serve_kernel_jit_sources)
+  target_sources(mlx_serve_kernel PRIVATE ${JIT_SOURCE_CPP})
 endif()
 
 # ----------------------------- Python Bindings -----------------------------
