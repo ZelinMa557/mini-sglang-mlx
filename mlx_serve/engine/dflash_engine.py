@@ -34,12 +34,12 @@ state besides ``pending_token``.
 
 Mirrored page layout
 --------------------
-Just like :class:`EagleMTPEngine`, the draft KV cache shares page
-IDs with the target via the same ``page_table``.  Each draft layer
-has its own per-layer KV buffer (multi-layer MHA), but the SAME
-page IDs are used at the SAME positions for both target and draft
-— letting the scheduler's :class:`CacheManager` (radix or naive)
-own all page lifecycle decisions, prefix cache included.
+The draft KV cache shares page IDs with the target via the same
+``page_table``.  Each draft layer has its own per-layer KV buffer
+(multi-layer MHA), but the SAME page IDs are used at the SAME
+positions for both target and draft — letting the scheduler's
+:class:`CacheManager` (radix or naive) own all page lifecycle
+decisions, prefix cache included.
 
 Per-iter page lifecycle (per req ``i``, ``j = num_drafts_accepted``):
 
@@ -295,10 +295,10 @@ class DflashEngine(SpecEngine):
         verify_len = K + 1
 
         # ---- Pre-allocate B*(K+1) shared pages -----------------------
-        # Same lifecycle as EagleMTPEngine: target verify writes K+1
-        # target K/V at ``slabs[:, 0..K]``; the draft also writes
-        # its (transient) proposal K/V at the same page IDs; we
-        # overwrite ``slabs[:, 0..j]`` with calibrated draft K/V at
+        # Target verify writes K+1 target K/V at ``slabs[:, 0..K]``;
+        # the draft also writes its (transient) proposal K/V at the
+        # same page IDs; we overwrite ``slabs[:, 0..j]`` with
+        # calibrated draft K/V at
         # the end of this iter; the tail ``slabs[:, j+1..K]`` is
         # then freed.
         flat_pages, slabs = self._allocate_iter_slabs(reqs)

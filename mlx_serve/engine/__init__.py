@@ -1,6 +1,5 @@
 from .config import SPEC_ALGOS, EngineConfig
 from .dflash_engine import DflashEngine
-from .eagle_mtp_engine import EagleMTPEngine
 from .engine import Engine, ForwardOutput
 from .sample import BatchSamplingArgs
 from .spec_engine import SpecEngine, SpecForwardOutput
@@ -11,7 +10,6 @@ def create_engine(config: EngineConfig) -> Engine:
 
     Dispatch:
 
-    * ``spec_algo == "mtp"``    → :class:`EagleMTPEngine`.
     * ``spec_algo == "dflash"`` → :class:`DflashEngine`.
     * ``spec_algo is None``     → base :class:`Engine` (no draft).
 
@@ -21,8 +19,6 @@ def create_engine(config: EngineConfig) -> Engine:
     """
     if config.spec_algo is None:
         return Engine(config)
-    if config.spec_algo == "mtp":
-        return EagleMTPEngine(config)
     if config.spec_algo == "dflash":
         return DflashEngine(config)
     raise ValueError(
@@ -34,7 +30,6 @@ def create_engine(config: EngineConfig) -> Engine:
 __all__ = [
     "BatchSamplingArgs",
     "DflashEngine",
-    "EagleMTPEngine",
     "Engine",
     "EngineConfig",
     "ForwardOutput",

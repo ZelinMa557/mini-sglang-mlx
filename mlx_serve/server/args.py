@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from pathlib import Path
 from typing import List
 
 import mlx.core as mx
@@ -60,10 +59,10 @@ class ServerArgs(SchedulerConfig):
 # ─────────────────────────────────────────────────────────────────────
 
 
-# CLI accepts the conventional capitalisations; internally we
+# CLI accepts the conventional capitalisation; internally we
 # normalise to lowercase to match :data:`mlx_serve.engine.SPEC_ALGOS`.
-_SPEC_ALGO_CHOICES = ["none", "mtp", "dflash"]
-_SPEC_ALGO_DISPLAY = ["None", "MTP", "DFlash"]
+_SPEC_ALGO_CHOICES = ["none", "dflash"]
+_SPEC_ALGO_DISPLAY = ["None", "DFlash"]
 
 
 def _normalise_spec_algo(raw: str | None) -> str | None:
@@ -201,11 +200,11 @@ def parse_args(args: List[str]) -> ServerArgs:
         "--spec-algo",
         # argparse runs ``type`` before ``choices``; ``str.lower``
         # makes the CLI flag case-insensitive while keeping the
-        # canonical capitalisations ("MTP", "DFlash") in --help.
+        # canonical capitalisation ("DFlash") in --help.
         type=str.lower,
         default=None,
         choices=_SPEC_ALGO_CHOICES,
-        metavar="{None,MTP,DFlash}",
+        metavar="{None,DFlash}",
         help="Speculative-decoding algorithm.  When set, --draft-path "
              "and --num-draft-tokens are required.  Default: no spec "
              "decoding.",
@@ -215,9 +214,6 @@ def parse_args(args: List[str]) -> ServerArgs:
         type=str,
         default=None,
         help="Path or repo ID of the speculative draft.  For "
-             "--spec-algo=MTP this is the MTP layer .safetensors "
-             "file (use scripts/download_qwen3_5_mtp_layer.py to "
-             "extract it from a Qwen3.5 checkpoint).  For "
              "--spec-algo=DFlash this is the DFlash draft model "
              "directory or a HF/ModelScope repo ID.",
     )
@@ -225,8 +221,7 @@ def parse_args(args: List[str]) -> ServerArgs:
         "--num-draft-tokens",
         type=int,
         default=0,
-        help="Drafts per spec iter (K).  For MTP: number of draft "
-             "forwards per decode iter.  For DFlash: block_size - 1 "
+        help="Drafts per spec iter (K).  For DFlash: block_size - 1 "
              "(must match the draft checkpoint's training-time "
              "block_size minus one).",
     )
@@ -301,25 +296,9 @@ def parse_args(args: List[str]) -> ServerArgs:
                 f"--spec-algo={spec_algo.upper()} requires "
                 f"--num-draft-tokens >= 1 (got {num_draft})"
             )
-        if spec_algo == "mtp":
-            # MTP draft is a single weights file pre-extracted by
-            # scripts/download_qwen3_5_mtp_layer.py.  We don't run
-            # remote resolution here: the script is the canonical
-            # producer of this file and pulling a whole MTP repo
-            # over the network would defeat the point.  Just
-            # expand ``~`` and check existence so we fail fast.
-            expanded = Path(draft_path).expanduser()
-            if not expanded.exists():
-                parser.error(
-                    f"--draft-path {draft_path!r} does not exist; for "
-                    "--spec-algo=MTP this should be a .safetensors file "
-                    "produced by scripts/download_qwen3_5_mtp_layer.py."
-                )
-            kwargs["draft_path"] = str(expanded)
-        else:  # dflash
-            kwargs["draft_path"] = resolve_repo(
-                draft_path, use_modelscope=use_modelscope,
-            )
+        kwargs["draft_path"] = resolve_repo(
+            draft_path, use_modelscope=use_modelscope,
+        )
 
     # ── dtype resolution (needs the resolved local model path) ───
     kwargs["dtype"] = _resolve_dtype(kwargs["dtype"], kwargs["model_path"])

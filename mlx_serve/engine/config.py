@@ -12,9 +12,9 @@ if TYPE_CHECKING:
 
 
 # Valid values for :attr:`EngineConfig.spec_algo`.  Kept lowercase
-# internally; the CLI also accepts the conventional capitalisations
-# ("MTP", "DFlash") and normalises before constructing the config.
-SPEC_ALGOS = ("mtp", "dflash")
+# internally; the CLI also accepts the conventional capitalisation
+# ("DFlash") and normalises before constructing the config.
+SPEC_ALGOS = ("dflash",)
 
 
 @dataclass(frozen=True)
@@ -27,16 +27,9 @@ class EngineConfig:
     kv_cache_gb: float | None = None
     max_seq_len_override: int | None = None
 
-    # ── Speculative decoding (unified) ──────────────────────────────
+    # ── Speculative decoding (DFlash) ───────────────────────────────
     # ``spec_algo`` selects the algorithm; the other two fields
-    # configure it.  Both MTP and DFlash share the same
-    # ``draft_path`` / ``num_draft_tokens`` knobs:
-    #
-    # * ``spec_algo="mtp"``:   ``draft_path`` is a single MTP
-    #   ``.safetensors`` file (or a directory containing one); the
-    #   draft itself is a single full-attention layer that shares
-    #   ``embed_tokens`` / ``lm_head`` with the target.
-    #   ``num_draft_tokens = K`` = the number of drafts per iter.
+    # configure it:
     #
     # * ``spec_algo="dflash"``: ``draft_path`` is a model directory
     #   (or remote repo ID) for a block-diffusion DFlash draft.
