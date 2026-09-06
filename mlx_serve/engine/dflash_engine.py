@@ -121,8 +121,9 @@ class DflashEngine(SpecEngine):
         )
 
         # Stash block_size BEFORE the base engine's __init__ runs so
-        # the mamba pool sizing has K available (Engine.__init__ →
-        # _create_mamba_pool → our _extra_mamba_checkpoints_per_req).
+        # the mamba pool sizing and the conv window buffers have K
+        # available (Engine.__init__ → _create_mamba_pool → our
+        # _extra_mamba_checkpoints_per_req / _verify_width).
         # block_size = K + 1: slot 0 of the block is the already-known
         # pending token T, slots 1..K are the masked positions the
         # draft fills in.
@@ -189,8 +190,15 @@ class DflashEngine(SpecEngine):
         )
 
     def _extra_mamba_checkpoints_per_req(self, config: EngineConfig) -> int:
-        # Target verify checkpoints K extra states per req.
-        return self._block_size - 1
+        # One scratch state slot per req: target verify replays the K+1
+        # window into the scratch slot; the accepted prefix is replayed
+        # back into the main slot after verification (no per-token
+        # snapshots — rollback is just a replay with a ragged length).
+        return 1
+
+    def _verify_width(self, config: EngineConfig) -> int:
+        # Verify window = block_size = K + 1 positions per req.
+        return self._block_size
 
     # ════════════════════════════════════════════════════════════════
     # Internal: calibrate the draft cache from captured target hidden.
@@ -356,7 +364,7 @@ class DflashEngine(SpecEngine):
         verify_input_ids = mx.concatenate(
             [pending_T[:, None], drafts], axis=1,
         ).reshape(-1)  # [B*(K+1)]
-        verify_batch, slot_ids_rows, new_mamba_slots = (
+        verify_batch, scratch_mamba_slots = (
             self._build_target_verify_batch(
                 reqs, verify_input_ids, flat_pages,
             )
@@ -413,7 +421,7 @@ class DflashEngine(SpecEngine):
         # AFTER calibration consumes verify_hidden + slabs; mamba
         # state and slab pages must stay live until here.
         self._release_iter_resources(
-            reqs, num_accepted_host, slabs, slot_ids_rows, new_mamba_slots,
+            reqs, num_accepted_host, slabs, verify_batch, scratch_mamba_slots,
         )
 
         # ---- Per-req state update + accepted_tokens output ----------

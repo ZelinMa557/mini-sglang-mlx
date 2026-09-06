@@ -110,7 +110,20 @@ class Batch:
     padded_reqs: List[Req] = field(init=False)  # may contain some dummy reqs for padding
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
+    # [B] int32 — per-req main mamba slot (prefill / decode / verify).
     mamba_slot_ids: mx.array | None = field(default=None, init=False, repr=False)
+    # [B] int32 — per-req scratch mamba slot used by replay-style
+    # target verify (copy of the main slot before the verify window).
+    mamba_scratch_slots: mx.array | None = field(default=None, init=False, repr=False)
+    # [B + 1] int32 — uniform CSR indptr over the B * W verify window
+    # (entry ``b`` = ``b * W``); the replay kernel walks
+    # ``[indptr[b], indptr[b + 1])`` per req.
+    mamba_verify_indptr: mx.array | None = field(default=None, init=False, repr=False)
+    # Per-linear-layer (q, k, v, g, beta) captured during target
+    # verify, keyed by linear_layer_idx.  Kept alive so the commit
+    # replay can gather each req's accepted prefix without recomputing
+    # the model projections.  Cleared once the commit finishes.
+    gdn_verify_captured: dict | None = field(default=None, init=False, repr=False)
     mamba_prefill_indptr: mx.array | None = field(default=None, init=False, repr=False)
 
     @property

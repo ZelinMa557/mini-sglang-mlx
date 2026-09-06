@@ -26,6 +26,12 @@ class MambaStateConfig:
     conv_shapes: List[List[tuple]]  # per-layer list of conv shapes
     temporal_shapes: List[tuple]  # per-layer temporal shape
     dtype: mx.Dtype = mx.float32
+    # Spec-decoding verify window width (K + 1).  When non-zero the
+    # pool also allocates per-layer conv window buffers — each slot
+    # holds ``verify_width`` sliding windows, one per verify step, so
+    # target verify can checkpoint the tiny conv state per step
+    # without allocating full (conv + temporal) slots.
+    verify_width: int = 0
 
 
 class MambaStatePool:
@@ -39,9 +45,11 @@ class MambaStatePool:
         self.num_slots = config.num_slots
         self.num_layers = config.num_layers
         self.dtype = config.dtype
+        self.verify_width = config.verify_width
 
         self._conv_buffers: List[List[mx.array]] = []
         self._temporal_buffers: List[mx.array] = []
+        self._conv_window_buffers: List[List[mx.array]] = []
 
         for layer_idx in range(config.num_layers):
             layer_convs: List[mx.array] = []
@@ -57,6 +65,19 @@ class MambaStatePool:
                 dtype=config.dtype,
             )
             self._temporal_buffers.append(temporal_buf)
+
+            layer_windows: List[mx.array] = []
+            if self.verify_width > 0:
+                # conv shape convention: (state_len, d_inner).
+                for state_len, d_inner in config.conv_shapes[layer_idx]:
+                    layer_windows.append(
+                        mx.zeros(
+                            (config.num_slots + 1, self.verify_width,
+                             state_len, d_inner),
+                            dtype=mx.bfloat16,
+                        )
+                    )
+            self._conv_window_buffers.append(layer_windows)
 
         mx.eval(*self._all_buffers())
 
@@ -75,6 +96,8 @@ class MambaStatePool:
         for layer_convs in self._conv_buffers:
             bufs.extend(layer_convs)
         bufs.extend(self._temporal_buffers)
+        for layer_windows in self._conv_window_buffers:
+            bufs.extend(layer_windows)
         return bufs
 
     @property
@@ -92,10 +115,9 @@ class MambaStatePool:
         """Allocate ``n`` slots in one Python call (no zero-init).
 
         Slots are returned in arbitrary order. Caller is responsible for
-        zeroing if needed — for MTP checkpoint slots we don't need to
-        zero because the GDN-verify kernel reads from ``slot_ids[:, 0]``
-        (the req's main slot, already populated) and writes to all
-        ``slot_ids[:, j]`` before any of those slots are read.
+        zeroing if needed — for verify scratch slots we don't need to
+        zero because the engine copies the main slot into each scratch
+        slot before the verify forward reads it.
         """
         if n == 0:
             return []
@@ -127,9 +149,8 @@ class MambaStatePool:
         """Batched scatter-copy: for each i, copy slot src[i] -> slot dst[i].
 
         ``src`` and ``dst`` are int32 arrays of the same shape.  Used by
-        MTP target-verify rollback: after greedy verification, we copy
-        ``slot_ids[i, accepted_i]`` (state after last accepted token) to
-        ``req.mamba_slot`` (the req's persistent main slot).
+        replay-style target verify to seed each req's scratch slot with
+        a copy of its main slot before the verify window is replayed.
         """
         assert src.shape == dst.shape
         for layer_convs in self._conv_buffers:
@@ -140,6 +161,16 @@ class MambaStatePool:
 
     def conv_state(self, layer_idx: int, group: int = 0) -> mx.array:
         return self._conv_buffers[layer_idx][group]
+
+    def conv_window(self, layer_idx: int, group: int = 0) -> mx.array:
+        """Per-step conv sliding windows used by replay-style verify.
+
+        Row ``[slot, j]`` holds the conv window *after* processing
+        ``j + 1`` verify tokens.  Only allocated when
+        :attr:`MambaStateConfig.verify_width` is non-zero.
+        """
+        assert self.verify_width > 0, "conv windows not allocated"
+        return self._conv_window_buffers[layer_idx][group]
 
     def temporal_state(self, layer_idx: int) -> mx.array:
         return self._temporal_buffers[layer_idx]

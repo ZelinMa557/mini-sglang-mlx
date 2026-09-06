@@ -124,14 +124,23 @@ class Engine:
         self.page_table[self.dummy_req.table_idx, :] = self.dummy_page
 
     def _extra_mamba_checkpoints_per_req(self, config: EngineConfig) -> int:
-        """Spec-decoding hook: extra mamba checkpoint slots per req.
+        """Spec-decoding hook: extra mamba state slots per req.
 
         The base engine reserves 2 slots per running req (main slot +
-        radix-cache buffer).  Speculative-decoding engines need extra
-        slots to checkpoint per-token state inside ``forward_verify``;
-        override this to bump the pool size accordingly — both EAGLE
-        and DFlash return ``num_draft_tokens`` (= K = block_size - 1
-        for DFlash).
+        radix-cache buffer).  Speculative-decoding engines need one
+        extra scratch slot per req: target verify replays the ``K+1``
+        window into the scratch slot, then the accepted prefix is
+        replayed back into the main slot once the accept counts are
+        known (no per-token snapshots).  Override to bump the pool
+        size accordingly — DFlash returns 1.
+        """
+        return 0
+
+    def _verify_width(self, config: EngineConfig) -> int:
+        """Spec-decoding hook: verify window width (W = K + 1) per req.
+
+        The mamba pool allocates per-layer conv window buffers of
+        width ``W`` when this is non-zero; spec engines override it.
         """
         return 0
 
@@ -142,10 +151,11 @@ class Engine:
         num_linear_layers = len(conv_shapes)
         # Default heuristic: 2x running reqs is enough for normal
         # serving (main slot + radix cache buffer); spec engines bump
-        # this by ``K`` (extra per-token verify checkpoints).  When
-        # ``config.num_mamba_slots`` is set we honour it verbatim —
-        # the project is meant to be a teaching codebase, so let the
-        # user own this knob if they want to experiment.
+        # this by 1 (the scratch slot used by replay-style target
+        # verify).  When ``config.num_mamba_slots`` is set we honour
+        # it verbatim — the project is meant to be a teaching
+        # codebase, so let the user own this knob if they want to
+        # experiment.
         if config.num_mamba_slots is not None:
             num_slots = config.num_mamba_slots
             logger.info(
@@ -165,6 +175,7 @@ class Engine:
             num_layers=num_linear_layers,
             conv_shapes=conv_shapes,
             temporal_shapes=temporal_shapes,
+            verify_width=self._verify_width(config),
         )
         return MambaStatePool(pool_config)
 

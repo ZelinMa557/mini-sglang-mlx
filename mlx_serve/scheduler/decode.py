@@ -11,8 +11,8 @@ class DecodeManager:
     running_reqs: Set[Req] = field(default_factory=set)
     # Per-req fudge added to ``inflight_tokens`` so the prefill scheduler
     # leaves room for transient peak allocations during an iter.  Used
-    # by MTP, where each iter briefly holds K extra target KV pages
-    # (and K mamba checkpoints) before freeing them after verify.
+    # by speculative decoding, where each iter briefly holds K extra
+    # target KV pages before freeing them after verify.
     extra_per_req: int = 0
 
     def filter_reqs(self, reqs: Iterable[Req]) -> None:

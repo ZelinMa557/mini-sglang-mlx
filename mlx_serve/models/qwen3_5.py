@@ -205,23 +205,26 @@ class GatedDeltaNet(nn.Module):
     def _apply_conv_verify(
         self, qkv: mx.array, batch: "Batch", mamba_pool: "MambaStatePool",
     ) -> mx.array:
-        """Target-verify: batched depthwise conv1d with per-step state checkpoint.
+        """Target-verify (replay-style): batched depthwise conv1d over the
+        ``W = K + 1`` token window starting from the scratch slot's conv
+        state (a copy of the main slot made before the verify forward).
 
-        All sequences must have the same ``num_draft`` tokens.
-        The initial conv state is read from ``slot_ids[:, 0]`` (base slots);
-        after token *j* the updated conv state is written to checkpoint slots
-        ``slot_ids[:, j]`` in a batched manner.
+        The per-step sliding windows are checkpointed into the small
+        window buffer (row ``[scratch_slot, j]`` = window after ``j + 1``
+        tokens) so ``GDNBackend.commit_verify`` can restore the window
+        after the accepted prefix without storing full per-token states.
         """
-        assert batch.mamba_slot_ids is not None
+        assert batch.mamba_scratch_slots is not None
         conv_buf = mamba_pool.conv_state(self.linear_layer_idx)
+        window_buf = mamba_pool.conv_window(self.linear_layer_idx)
         state_len = self.conv_kernel_size - 1
 
-        slot_ids = batch.mamba_slot_ids  # [batch_size, num_draft]
-        batch_size, num_draft = slot_ids.shape
+        scratch_slots = batch.mamba_scratch_slots  # [batch_size]
+        batch_size = scratch_slots.shape[0]
+        num_draft = qkv.shape[0] // batch_size
 
         # 1. Gather base conv states: [batch_size, K-1, conv_dim]
-        base_slots = slot_ids[:, 0]
-        conv_state = conv_buf[base_slots]
+        conv_state = conv_buf[scratch_slots]
 
         # 2. Reshape qkv to [batch_size, num_draft, conv_dim]
         seg = qkv.reshape(batch_size, num_draft, self.conv_dim)
@@ -231,10 +234,9 @@ class GatedDeltaNet(nn.Module):
         conv_out = self.conv1d(conv_input)
         conv_out = conv_out.reshape(batch_size * num_draft, self.conv_dim)
 
-        # 4. Save per-step conv states in a batch-aware loop over draft steps.
+        # 4. Save per-step conv windows in a batch-aware loop over draft steps.
         for j in range(num_draft):
-            ck_slots = slot_ids[:, j]
-            conv_buf[ck_slots] = conv_input[:, j + 1 : j + 1 + state_len, :]
+            window_buf[scratch_slots, j] = conv_input[:, j + 1 : j + 1 + state_len, :]
 
         return nn.silu(conv_out)
 
