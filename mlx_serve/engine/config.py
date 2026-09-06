@@ -45,10 +45,12 @@ class EngineConfig:
     # ── Mamba state pool sizing (manual override) ───────────────────
     # When set, ``Engine._create_mamba_pool`` uses this exact slot
     # count instead of computing one from ``max_running_req`` and
-    # the spec method's per-req checkpoint footprint.  Useful for
-    # hybrid models (Qwen3.5) where the default heuristic may
-    # over- or under-allocate; this knob is exposed for didactic
-    # purposes (the project is meant to be a teaching codebase).
+    # the spec method's per-req scratch-slot footprint (spec engines
+    # reserve 2 + 1 slots per req: main + radix buffer + verify
+    # scratch).  Useful for hybrid models (Qwen3.5) where the
+    # default heuristic may over- or under-allocate; this knob is
+    # exposed for didactic purposes (the project is meant to be a
+    # teaching codebase).
     num_mamba_slots: int | None = None
 
     def __post_init__(self) -> None:
