@@ -81,10 +81,10 @@ class SpecEngine(Engine, ABC):
 
     Subclasses MAY override:
 
-    * :meth:`_extra_mamba_checkpoints_per_req` if the spec method
-      needs more than one scratch slot per req for verify (default
-      ``1``); :meth:`_verify_width` if the verify window width is
-      not ``K + 1``.
+    * :meth:`_verify_width` if the verify window width is not
+      ``K + 1``.  (This class already sets
+      :attr:`Engine.extra_mamba_slots_per_req` to ``1`` — the single
+      scratch slot every spec method needs for replay-style verify.)
 
     The :class:`Scheduler` calls :meth:`run_iter` once per scheduled
     batch and consumes :class:`SpecForwardOutput`.
@@ -99,13 +99,12 @@ class SpecEngine(Engine, ABC):
         # the scheduler on every sub-forward.
         self._cache_manager: "CacheManager | None" = None
 
-    # Override the base hook so :meth:`Engine._create_mamba_pool` sizes
-    # the mamba pool to hold one extra scratch slot per running req
-    # (replay-style target verify).  The count is independent of K:
-    # the whole K+1 window is replayed into one scratch slot and the
-    # accepted prefix is replayed back into the main slot.
-    def _extra_mamba_checkpoints_per_req(self, config: EngineConfig) -> int:
-        return 1
+    # One extra scratch slot per running req (replay-style target
+    # verify), on top of the base 2 (main slot + radix buffer).  The
+    # count is independent of K: the whole K+1 window is replayed
+    # into one scratch slot and the accepted prefix is replayed back
+    # into the main slot.
+    extra_mamba_slots_per_req: int = 1
 
     def set_cache_manager(self, cache_manager: "CacheManager") -> None:
         self._cache_manager = cache_manager
