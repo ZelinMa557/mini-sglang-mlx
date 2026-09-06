@@ -123,18 +123,12 @@ class Engine:
         )
         self.page_table[self.dummy_req.table_idx, :] = self.dummy_page
 
-    def _extra_mamba_checkpoints_per_req(self, config: EngineConfig) -> int:
-        """Spec-decoding hook: extra mamba state slots per req.
-
-        The base engine reserves 2 slots per running req (main slot +
-        radix-cache buffer).  Speculative-decoding engines need one
-        extra scratch slot per req: target verify replays the ``K+1``
-        window into the scratch slot, then the accepted prefix is
-        replayed back into the main slot once the accept counts are
-        known (no per-token snapshots).  Override to bump the pool
-        size accordingly — DFlash returns 1.
-        """
-        return 0
+    #: Extra mamba state slots per running req, on top of the base 2
+    #: (main slot + radix-cache buffer).  Spec engines bump this to 1:
+    #: target verify replays the ``K+1`` window into one scratch slot
+    #: and the accepted prefix is replayed back into the main slot
+    #: once the accept counts are known (no per-token snapshots).
+    extra_mamba_slots_per_req: int = 0
 
     def _verify_width(self, config: EngineConfig) -> int:
         """Spec-decoding hook: verify window width (W = K + 1) per req.
@@ -162,13 +156,13 @@ class Engine:
                 "Using explicit num_mamba_slots=%d (override)", num_slots,
             )
         else:
-            multiplier = 2 + self._extra_mamba_checkpoints_per_req(config)
+            multiplier = 2 + self.extra_mamba_slots_per_req
             num_slots = config.max_running_req * multiplier
             logger.info(
                 "Auto-sizing mamba pool: num_slots=%d "
                 "(= max_running_req * (2 + %d extra))",
                 num_slots,
-                self._extra_mamba_checkpoints_per_req(config),
+                self.extra_mamba_slots_per_req,
             )
         pool_config = MambaStateConfig(
             num_slots=num_slots,

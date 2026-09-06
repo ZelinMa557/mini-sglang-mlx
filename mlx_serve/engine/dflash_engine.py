@@ -121,9 +121,8 @@ class DflashEngine(SpecEngine):
         )
 
         # Stash block_size BEFORE the base engine's __init__ runs so
-        # the mamba pool sizing and the conv window buffers have K
-        # available (Engine.__init__ → _create_mamba_pool → our
-        # _extra_mamba_checkpoints_per_req / _verify_width).
+        # the conv window buffers have K available (Engine.__init__ →
+        # _create_mamba_pool → our _verify_width).
         # block_size = K + 1: slot 0 of the block is the already-known
         # pending token T, slots 1..K are the masked positions the
         # draft fills in.
@@ -188,13 +187,6 @@ class DflashEngine(SpecEngine):
             mamba_pool=None,
             gdn_backend=None,
         )
-
-    def _extra_mamba_checkpoints_per_req(self, config: EngineConfig) -> int:
-        # One scratch state slot per req: target verify replays the K+1
-        # window into the scratch slot; the accepted prefix is replayed
-        # back into the main slot after verification (no per-token
-        # snapshots — rollback is just a replay with a ragged length).
-        return 1
 
     def _verify_width(self, config: EngineConfig) -> int:
         # Verify window = block_size = K + 1 positions per req.
