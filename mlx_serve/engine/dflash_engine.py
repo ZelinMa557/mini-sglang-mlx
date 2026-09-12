@@ -74,7 +74,7 @@ from typing import List
 import mlx.core as mx
 
 from mlx_serve.attention import AttnBackend
-from mlx_serve.core import Batch, BatchPhase, Context, use_ctx
+from mlx_serve.core import Batch, BatchPhase, Context, Req, use_ctx
 from mlx_serve.kvcache.mha_pool import MHAKVCache
 from mlx_serve.models.dflash import load_dflash_draft_model
 from mlx_serve.utils import init_logger
@@ -107,9 +107,16 @@ class DflashEngine(SpecEngine):
     ``is_cross_attention`` / ``sliding_window_size``.
     """
 
+    #: Registry key in :data:`mlx_serve.engine.SPEC_ALGOS`, and the
+    #: ``model_type`` the draft checkpoint is loaded as.  :class:`Dflash2Engine`
+    #: overrides both while inheriting the whole iter lifecycle.
+    spec_algo = "dflash"
+    draft_model_type = "dflash"
+
     def __init__(self, config: EngineConfig):
-        assert config.spec_algo == "dflash", (
-            f"DflashEngine requires spec_algo='dflash', got {config.spec_algo!r}"
+        assert config.spec_algo == self.spec_algo, (
+            f"{type(self).__name__} requires spec_algo={self.spec_algo!r}, "
+            f"got {config.spec_algo!r}"
         )
         assert config.draft_path is not None, (
             "DflashEngine requires EngineConfig.draft_path."
@@ -138,6 +145,7 @@ class DflashEngine(SpecEngine):
         )
         self.draft_model = load_dflash_draft_model(
             config.draft_path, self.model,
+            model_type=self.draft_model_type,
         )
         self.draft_config = self.draft_model.args
         logger.info(
@@ -285,6 +293,74 @@ class DflashEngine(SpecEngine):
         return SpecForwardOutput(accepted_tokens=accepted)
 
     # ════════════════════════════════════════════════════════════════
+    # Internal: draft proposal
+    # ════════════════════════════════════════════════════════════════
+
+    def _build_proposal_batch(
+        self,
+        reqs: List[Req],
+        flat_pages: mx.array,
+    ) -> Batch:
+        """Build the draft proposal batch — ``[T, MASK*K]`` per req.
+
+        ``T`` is the req's pending token (the target's last output);
+        the ``K`` mask slots are what the draft fills in.  The
+        metadata describes a ``K+1``-wide extend window over the
+        draft's calibrated cache, and ``out_loc`` points the draft's
+        transient proposal K/V at the same slabs target verify is
+        about to use (mirrored layout).
+        """
+        K = self.K
+        B = len(reqs)
+        verify_len = K + 1
+
+        proposal_input_ids = mx.concatenate(
+            [
+                mx.concatenate(
+                    [
+                        r.pending_token,  # type: ignore[list-item]
+                        mx.full((K,), self.mask_token_id, dtype=mx.int32),
+                    ]
+                )
+                for r in reqs
+            ]
+        )
+        proposal_metadata = self.draft_attn_backend.build_prefill_metadata(
+            reqs,
+            extend_lens=[verify_len] * B,
+            kv_lens=[r.cached_len + verify_len for r in reqs],
+        )
+
+        proposal_batch = Batch(reqs=reqs, phase=BatchPhase.PREFILL)
+        proposal_batch.input_ids = proposal_input_ids
+        proposal_batch.out_loc = flat_pages
+        proposal_batch.padded_reqs = reqs
+        proposal_batch.attn_metadata = proposal_metadata
+        return proposal_batch
+
+    def _propose_drafts(self, proposal_batch: Batch) -> mx.array:
+        """Run the draft forward and pick ``K`` drafts per req.
+
+        The draft KV cache is ALREADY calibrated up through
+        ``cached_len - 1`` (end-of-prev-iter calibration / end-of-
+        prefill calibration).  Proposal queries at positions
+        ``[c..c+K]`` write their own transient K/V at ``slabs[:, 0..K]``
+        (used for self-attention within the block) and read cached
+        draft K/V at ``[0..c-1]`` from prior iters.
+
+        Returns:
+            ``[B, K]`` int32 drafts, taken from slots ``1..K`` (slot 0
+            is the known pending token).
+        """
+        with (
+            use_ctx(self.draft_ctx),
+            self.draft_ctx.forward_batch(proposal_batch),
+        ):
+            draft_logits_flat = self.draft_model(proposal_batch.input_ids)
+        draft_logits = draft_logits_flat.reshape(len(proposal_batch.reqs), self.K + 1, -1)
+        return mx.argmax(draft_logits[:, 1:, :], axis=-1).astype(mx.int32)
+
+    # ════════════════════════════════════════════════════════════════
     # Decode iter: proposal → verify → calibrate → commit
     # ════════════════════════════════════════════════════════════════
 
@@ -303,51 +379,9 @@ class DflashEngine(SpecEngine):
         # then freed.
         flat_pages, slabs = self._allocate_iter_slabs(reqs)
 
-        # ---- Build proposal batch ------------------------------------
-        # Per req: input_ids = [T, MASK*K] (length K+1).  T is the
-        # known pending token (target's last output); the K mask
-        # positions are predicted by the draft.
-        proposal_input_ids = mx.concatenate(
-            [
-                mx.concatenate(
-                    [
-                        r.pending_token,  # type: ignore[list-item]
-                        mx.full((K,), self.mask_token_id, dtype=mx.int32),
-                    ]
-                )
-                for r in reqs
-            ]
-        )
-
-        proposal_metadata = self.draft_attn_backend.build_prefill_metadata(
-            reqs,
-            extend_lens=[verify_len] * B,
-            kv_lens=[r.cached_len + verify_len for r in reqs],
-        )
-        proposal_batch = Batch(reqs=reqs, phase=BatchPhase.PREFILL)
-        proposal_batch.input_ids = proposal_input_ids
-        proposal_batch.out_loc = flat_pages
-        proposal_batch.padded_reqs = reqs
-        proposal_batch.attn_metadata = proposal_metadata
-
         # ---- Draft proposal forward (NO calibration interleaved) ----
-        # The draft KV cache is ALREADY calibrated up through
-        # ``cached_len - 1`` (end-of-prev-iter calibration / end-of-
-        # prefill calibration).  Proposal queries at positions
-        # [c..c+K] write their own transient K/V at slabs[:, 0..K]
-        # (used for self-attention within the block) and read cached
-        # draft K/V at [0..c-1] from prior iters.
-        with (
-            use_ctx(self.draft_ctx),
-            self.draft_ctx.forward_batch(proposal_batch),
-        ):
-            draft_logits_flat = self.draft_model(proposal_input_ids)
-        V = draft_logits_flat.shape[-1]
-        draft_logits = draft_logits_flat.reshape(B, verify_len, V)
-        # Drafts come from slots 1..K (slot 0 is the known pending T).
-        drafts = mx.argmax(
-            draft_logits[:, 1:, :], axis=-1,
-        ).astype(mx.int32)  # [B, K]
+        proposal_batch = self._build_proposal_batch(reqs, flat_pages)
+        drafts = self._propose_drafts(proposal_batch)  # [B, K]
 
         # ---- Target verify on [T, d_1, ..., d_K] --------------------
         pending_T = mx.stack(
@@ -365,7 +399,9 @@ class DflashEngine(SpecEngine):
             captured, verify_logits_flat = self.model(
                 capture_layer_ids=self.target_layer_ids,
             )
-        verify_logits = verify_logits_flat.reshape(B, verify_len, V)
+        verify_logits = verify_logits_flat.reshape(
+            B, verify_len, verify_logits_flat.shape[-1],
+        )
         # captured[layer] is [B*(K+1), hidden_size] — reshape per-req.
         verify_hiddens_per_layer = [
             h.reshape(B, verify_len, -1) for h in captured

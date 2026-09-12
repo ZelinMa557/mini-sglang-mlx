@@ -9,7 +9,7 @@ from mlx_serve_kernel import paged_prefill_attention, store_kv_cache
 HEAD_DIM = 128
 
 
-def _build_uniform_score_case(q_len, prefix_len, dtype=mx.float16):
+def _build_uniform_score_case(q_len, prefix_len, dtype=mx.bfloat16):
     kv_len = prefix_len + q_len
     q = mx.zeros((q_len, 1, HEAD_DIM), dtype=dtype)
     k_cache = mx.zeros((kv_len, 1, HEAD_DIM), dtype=dtype)
@@ -110,19 +110,31 @@ def test_sliding_causal_window_crosses_prefix_boundary():
     _assert_attention_weights(4, 4, sliding_window_size=5)
 
 
+def test_bidirectional_windowed_over_prefix():
+    # DFlash2 layers: bidirectional inside the proposal block (DFlash
+    # block-diffusion) while still windowed over the cached context.
+    _assert_attention_weights(4, 4, is_cross_attention=True, sliding_window_size=5)
+
+
+def test_bidirectional_window_clips_prefix_only():
+    # The window bounds how far back the context reaches but never
+    # clips the block itself (a block is at most block_size tokens).
+    _assert_attention_weights(2, 6, is_cross_attention=True, sliding_window_size=3)
+
+
 def test_store_kv_cache_writes_are_reachable_by_prefill():
     q_len = 4
     page_ids = mx.array([3, 1, 4, 2], dtype=mx.int32)
-    q = mx.zeros((q_len, 1, HEAD_DIM), dtype=mx.float16)
-    k = mx.zeros((q_len, 1, HEAD_DIM), dtype=mx.float16)
+    q = mx.zeros((q_len, 1, HEAD_DIM), dtype=mx.bfloat16)
+    k = mx.zeros((q_len, 1, HEAD_DIM), dtype=mx.bfloat16)
 
     v_np = np.zeros((q_len, 1, HEAD_DIM), dtype=np.float32)
     for pos in range(q_len):
         v_np[pos, 0, pos] = 1.0
-    v = mx.array(v_np, dtype=mx.float16)
+    v = mx.array(v_np, dtype=mx.bfloat16)
 
-    k_cache = mx.zeros((5, 1, HEAD_DIM), dtype=mx.float16)
-    v_cache = mx.zeros((5, 1, HEAD_DIM), dtype=mx.float16)
+    k_cache = mx.zeros((5, 1, HEAD_DIM), dtype=mx.bfloat16)
+    v_cache = mx.zeros((5, 1, HEAD_DIM), dtype=mx.bfloat16)
     mx.eval(q, k, v, k_cache, v_cache, page_ids)
     store_kv_cache(k_cache, v_cache, page_ids, k, v)
 
