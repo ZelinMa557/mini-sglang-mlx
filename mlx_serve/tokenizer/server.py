@@ -12,6 +12,7 @@ from mlx_serve.message import (
     BatchFrontendMsg,
     BatchTokenizerMsg,
     DetokenizeMsg,
+    PromptReadyMsg,
     TokenizeMsg,
     UserMsg,
     UserReply,
@@ -34,7 +35,6 @@ def tokenize_worker(
     frontend_addr: str,
     local_bs: int,
     tokenizer_id: int = -1,
-    enable_thinking: bool = False,
     ack_queue: mp.Queue[str] | None = None,
 ) -> None:
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
@@ -47,7 +47,7 @@ def tokenize_worker(
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer, enable_thinking=enable_thinking)
+    tokenize_manager = TokenizeManager(tokenizer)
     detokenize_manager = DetokenizeManager(tokenizer)
 
     if ack_queue is not None:
@@ -82,6 +82,19 @@ def tokenize_worker(
 
             if len(tokenize_msg) > 0:
                 tensors = tokenize_manager.tokenize(tokenize_msg)
+                # The frontend needs the rendered prompt as the response
+                # parser's prefix. It must arrive before any generated token
+                # does, which is guaranteed by sending it before the request
+                # reaches the backend.
+                prompts = [
+                    PromptReadyMsg(uid=msg.uid, prompt=prompt)
+                    for msg, (_, prompt) in zip(tokenize_msg, tensors, strict=True)
+                    if prompt is not None
+                ]
+                if len(prompts) == 1:
+                    send_frontend.put(prompts[0])
+                elif len(prompts) > 1:
+                    send_frontend.put(BatchFrontendMsg(data=prompts))
                 batch_output = BatchBackendMsg(
                     data=[
                         UserMsg(
@@ -89,7 +102,7 @@ def tokenize_worker(
                             input_ids=t,
                             sampling_params=msg.sampling_params,
                         )
-                        for msg, t in zip(tokenize_msg, tensors, strict=True)
+                        for msg, (t, _) in zip(tokenize_msg, tensors, strict=True)
                     ]
                 )
                 if len(batch_output.data) == 1:

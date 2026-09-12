@@ -19,7 +19,6 @@ class ServerArgs(SchedulerConfig):
     num_tokenizer: int = 0
     silent_output: bool = False
     use_modelscope: bool = False
-    enable_thinking: bool = False
 
     @property
     def share_tokenizer(self) -> bool:
@@ -249,12 +248,6 @@ def parse_args(args: List[str]) -> ServerArgs:
         help="Number of tokenizer workers.  0 means the tokenizer is "
              "shared with the detokenizer.",
     )
-    parser.add_argument(
-        "--enable-thinking",
-        action="store_true",
-        help="Enable thinking / reasoning mode in the chat template.",
-    )
-
     # ── Parse + validate ──────────────────────────────────────────
     kwargs = parser.parse_args(args).__dict__.copy()
 
