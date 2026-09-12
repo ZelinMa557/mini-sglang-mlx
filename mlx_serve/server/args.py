@@ -61,8 +61,8 @@ class ServerArgs(SchedulerConfig):
 
 # CLI accepts the conventional capitalisation; internally we
 # normalise to lowercase to match :data:`mlx_serve.engine.SPEC_ALGOS`.
-_SPEC_ALGO_CHOICES = ["none", "dflash"]
-_SPEC_ALGO_DISPLAY = ["None", "DFlash"]
+_SPEC_ALGO_CHOICES = ["none", "dflash", "dflash2"]
+_SPEC_ALGO_DISPLAY = ["None", "DFlash", "DFlash2"]
 
 
 def _normalise_spec_algo(raw: str | None) -> str | None:
@@ -204,7 +204,7 @@ def parse_args(args: List[str]) -> ServerArgs:
         type=str.lower,
         default=None,
         choices=_SPEC_ALGO_CHOICES,
-        metavar="{None,DFlash}",
+        metavar="{None,DFlash,DFlash2}",
         help="Speculative-decoding algorithm.  When set, --draft-path "
              "and --num-draft-tokens are required.  Default: no spec "
              "decoding.",
@@ -214,16 +214,16 @@ def parse_args(args: List[str]) -> ServerArgs:
         type=str,
         default=None,
         help="Path or repo ID of the speculative draft.  For "
-             "--spec-algo=DFlash this is the DFlash draft model "
-             "directory or a HF/ModelScope repo ID.",
+             "--spec-algo=DFlash / DFlash2 this is the DFlash draft "
+             "model directory or a HF/ModelScope repo ID.",
     )
     parser.add_argument(
         "--num-draft-tokens",
         type=int,
         default=0,
-        help="Drafts per spec iter (K).  For DFlash: block_size - 1 "
-             "(must match the draft checkpoint's training-time "
-             "block_size minus one).",
+        help="Drafts per spec iter (K).  For DFlash / DFlash2: "
+             "block_size - 1 (must match the draft checkpoint's "
+             "training-time block_size minus one).",
     )
 
     # ── Serving frontend ──────────────────────────────────────────

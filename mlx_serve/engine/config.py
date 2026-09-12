@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 # Valid values for :attr:`EngineConfig.spec_algo`.  Kept lowercase
 # internally; the CLI also accepts the conventional capitalisation
 # ("DFlash") and normalises before constructing the config.
-SPEC_ALGOS = ("dflash",)
+SPEC_ALGOS = ("dflash", "dflash2")
 
 
 @dataclass(frozen=True)
@@ -27,14 +27,16 @@ class EngineConfig:
     kv_cache_gb: float | None = None
     max_seq_len_override: int | None = None
 
-    # ── Speculative decoding (DFlash) ───────────────────────────────
+    # ── Speculative decoding (DFlash / DFlash2) ─────────────────────
     # ``spec_algo`` selects the algorithm; the other two fields
     # configure it:
     #
-    # * ``spec_algo="dflash"``: ``draft_path`` is a model directory
-    #   (or remote repo ID) for a block-diffusion DFlash draft.
-    #   ``num_draft_tokens = K``; the draft block size at runtime
-    #   is ``K + 1`` (verify input length per req = K + 1).
+    # * ``spec_algo="dflash"`` / ``"dflash2"``: ``draft_path`` is a
+    #   model directory (or remote repo ID) for a block-diffusion
+    #   DFlash draft.  ``num_draft_tokens = K``; the draft block size
+    #   at runtime is ``K + 1`` (verify input length per req = K + 1).
+    #   DFlash2 differs only in how the block's tokens are chosen
+    #   (candidate-selector path walk vs per-slot argmax).
     #
     # ``spec_algo=None`` (default) → no speculative decoding; the
     # other two fields are ignored.

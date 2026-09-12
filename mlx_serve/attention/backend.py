@@ -100,19 +100,16 @@ class AttnBackend:
                 key, in addition to the cached prefix.  Used by
                 DFlash full-attention layers, where the masked
                 block tokens predict each other bidirectionally.
-                Has no effect on the decode path.
+                (Cached prefix keys sit at earlier positions than
+                every extend query, so dropping the bound leaves
+                their visibility unchanged.)  Has no effect on the
+                decode path.
             sliding_window_size: when ``> 0``, restrict each query
                 to keys whose absolute target-sequence position is
                 within ``W`` of (and ≤, when causal) the query's
-                position.  Used by DFlash sliding-attention layers
-                (``is_cross_attention=False, sliding_window_size=W``).
-                ``0`` means "no window".
+                position.  ``0`` means "no window".
 
-            The two flags are **mutually exclusive** — either drop
-            the causal upper bound (``is_cross_attention=True``) or
-            restrict the lower bound to a sliding window
-            (``sliding_window_size > 0``), but not both.  The three
-            valid combinations are:
+            The two flags compose, giving four masks:
 
             =====================  =====================  =====================
             is_cross_attention     sliding_window_size    mask
@@ -120,10 +117,14 @@ class AttnBackend:
             ``False``              ``0``                  causal (default)
             ``True``               ``0``                  full / bidirectional
             ``False``              ``W > 0``              causal + window
+            ``True``               ``W > 0``              bidirectional + window
             =====================  =====================  =====================
 
-            Passing both is rejected (the kernel is allowed to
-            assume it never happens).
+            The last row is DFlash2: its layers are bidirectional
+            inside the proposal block while still windowed over the
+            cached context.  Since a proposal block is at most
+            ``block_size`` tokens, the window never clips block keys
+            — it only bounds how far back the context reaches.
 
         ``is_cross_attention`` / ``sliding_window_size`` are forwarded
         to :func:`mlx_serve_kernel.paged_prefill_attention` and are
@@ -132,10 +133,6 @@ class AttnBackend:
         """
         assert sliding_window_size >= 0, (
             f"sliding_window_size must be >= 0, got {sliding_window_size}"
-        )
-        assert not (is_cross_attention and sliding_window_size > 0), (
-            "is_cross_attention=True and sliding_window_size>0 are "
-            "mutually exclusive."
         )
 
         metadata = batch.attn_metadata

@@ -1,4 +1,5 @@
 from .config import SPEC_ALGOS, EngineConfig
+from .dflash2_engine import Dflash2Engine
 from .dflash_engine import DflashEngine
 from .engine import Engine, ForwardOutput
 from .sample import BatchSamplingArgs
@@ -10,8 +11,9 @@ def create_engine(config: EngineConfig) -> Engine:
 
     Dispatch:
 
-    * ``spec_algo == "dflash"`` → :class:`DflashEngine`.
-    * ``spec_algo is None``     → base :class:`Engine` (no draft).
+    * ``spec_algo == "dflash"``  → :class:`DflashEngine`.
+    * ``spec_algo == "dflash2"`` → :class:`Dflash2Engine`.
+    * ``spec_algo is None``      → base :class:`Engine` (no draft).
 
     ``EngineConfig.__post_init__`` already validates that
     ``draft_path`` / ``num_draft_tokens`` are set when ``spec_algo``
@@ -21,6 +23,8 @@ def create_engine(config: EngineConfig) -> Engine:
         return Engine(config)
     if config.spec_algo == "dflash":
         return DflashEngine(config)
+    if config.spec_algo == "dflash2":
+        return Dflash2Engine(config)
     raise ValueError(
         f"Unknown spec_algo {config.spec_algo!r}; expected one of "
         f"{SPEC_ALGOS} or None."
@@ -29,6 +33,7 @@ def create_engine(config: EngineConfig) -> Engine:
 
 __all__ = [
     "BatchSamplingArgs",
+    "Dflash2Engine",
     "DflashEngine",
     "Engine",
     "EngineConfig",

@@ -83,6 +83,18 @@ class ModelArgs(BaseModelArgs):
     layer_types: Tuple[str, ...] = field(default_factory=tuple)
     # Sliding window for ``sliding_attention`` layers (None otherwise).
     sliding_window: Optional[int] = None
+    # Whether queries may attend to *later* keys inside the proposal
+    # block.  ``None`` mirrors the upstream default of
+    # ``is_causal = is_sliding``:
+    #
+    # * ``full_attention`` → ``False``: the block is bidirectional.
+    # * ``sliding_attention`` → ``True``: the block is causal, with a
+    #   sliding window over the cached context.
+    #
+    # DFlash2 checkpoints set this to ``False`` even for sliding
+    # layers, which makes the block bidirectional *and* keeps the
+    # window over the context (see :meth:`DFlashAttention.__call__`).
+    is_causal: Optional[bool] = None
     mask_token_id: int = 0
     rope_scaling: Optional[Dict[str, Any]] = None
     partial_rotary_factor: float = 1.0
@@ -194,6 +206,11 @@ class DFlashAttention(nn.Module):
         self.sliding_window = (
             args.sliding_window if self.is_sliding else None
         )
+        # Upstream default: only sliding layers are causal inside the
+        # proposal block (full layers predict the block bidirectionally).
+        self.is_causal = (
+            self.is_sliding if args.is_causal is None else args.is_causal
+        )
 
         self.q_proj = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
@@ -251,13 +268,21 @@ class DFlashAttention(nn.Module):
         attention via :meth:`AttnBackend.forward`, passing the
         block-diffusion mask flags:
 
-        * ``full_attention`` layer  →  ``is_cross_attention=True,
-          sliding_window_size=0`` (bidirectional within the proposal
-          block, full visibility over cached prefix).
-        * ``sliding_attention`` layer →  ``is_cross_attention=False,
-          sliding_window_size=W`` (causal + windowed).
+        * ``is_causal=False`` layer → ``is_cross_attention=True``:
+          queries attend to later keys *within the proposal block*
+          (the block predicts itself bidirectionally).  Cached prefix
+          keys sit at earlier positions than every block query, so
+          dropping the causal bound leaves their visibility unchanged.
+        * ``sliding_attention`` layer → ``sliding_window_size=W``:
+          restricts both prefix and block keys to an absolute-position
+          window.
 
-        See :meth:`AttnBackend.forward` for the mask truth table.
+        ``DFlashAttention.is_causal`` defaults to ``is_sliding``
+        (``full`` layers bidirectional, ``sliding`` layers causal).
+        DFlash2 checkpoints set ``is_causal=False`` with *all* layers
+        sliding, so the flags combine: bidirectional within the block
+        **and** windowed over the context.  See
+        :meth:`AttnBackend.forward` for the mask truth table.
         """
         L = x.shape[0]
 
@@ -274,7 +299,7 @@ class DFlashAttention(nn.Module):
 
         out = ctx.attn_backend.forward(
             q, k, v, self.layer_id, ctx.batch,
-            is_cross_attention=not self.is_sliding,
+            is_cross_attention=not self.is_causal,
             sliding_window_size=self.sliding_window or 0,
         )
         return self.o_proj(out.reshape(L, -1))
@@ -336,6 +361,10 @@ class Model(nn.Module):
     len(K/V writes)``.
     """
 
+    #: Layer module to instantiate per draft layer.  DFlash2 swaps in
+    #: its own layer (dynamic conv around each sublayer).
+    layer_class = DFlashDecoderLayer
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -347,7 +376,7 @@ class Model(nn.Module):
         )
 
         self.layers = [
-            DFlashDecoderLayer(args, i)
+            self.layer_class(args, i)
             for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
@@ -413,6 +442,26 @@ class Model(nn.Module):
 
     # ── Proposal forward ──────────────────────────────────────────────
 
+    def hidden_states(self, input_ids: mx.array) -> mx.array:
+        """Run the draft backbone over a ``[B*(K+1)]`` block input.
+
+        Returns the post-``norm`` hidden state ``[B*(K+1), hidden_size]``.
+        """
+        assert self.embed_tokens is not None
+        h = self.embed_tokens(input_ids)
+        for layer in self.layers:
+            h = layer(h)
+        return self.norm(h)
+
+    def compute_logits(self, hidden: mx.array) -> mx.array:
+        """Project post-``norm`` hidden through the (shared) LM head."""
+        assert self.lm_head is not None
+        logits = self.lm_head(hidden)
+        if self.args.final_logit_softcapping is not None:
+            cap = self.args.final_logit_softcapping
+            logits = mx.tanh(logits / cap) * cap
+        return logits
+
     def __call__(self, input_ids: mx.array) -> mx.array:
         """Proposal forward over a ``[B*(K+1)]`` block input.
 
@@ -421,16 +470,7 @@ class Model(nn.Module):
             extract per-req slices ``[1..K]`` (the K useful drafts)
             via the qo_indptr in ``ctx.batch.attn_metadata``.
         """
-        assert self.embed_tokens is not None and self.lm_head is not None
-        h = self.embed_tokens(input_ids)
-        for layer in self.layers:
-            h = layer(h)
-        h = self.norm(h)
-        logits = self.lm_head(h)
-        if self.args.final_logit_softcapping is not None:
-            cap = self.args.final_logit_softcapping
-            logits = mx.tanh(logits / cap) * cap
-        return logits
+        return self.compute_logits(self.hidden_states(input_ids))
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -441,14 +481,16 @@ class Model(nn.Module):
 def load_dflash_draft_model(
     dflash_path: str,
     target_model: nn.Module,
+    model_type: str = "dflash",
 ) -> "Model":
     """Load a DFlash draft, sharing embed / lm_head with *target_model*.
 
     Delegates the bulk of the work — config parsing, weight loading
     and quantisation — to the generic
     :func:`mlx_serve.models.load_model`; the only extra step is
-    forcing ``model_type="dflash"`` (so the discovery picks up this
-    module) and binding shared weights from the target.
+    forcing ``model_type`` (so the discovery picks up the right
+    module — ``dflash`` or, for the DFlash2 variant, ``dflash2``) and
+    binding shared weights from the target.
 
     Args:
         dflash_path: Local directory or HF repo containing the DFlash
@@ -456,9 +498,13 @@ def load_dflash_draft_model(
         target_model: An already-loaded mlx-serve target model; its
             ``model.embed_tokens`` (and ``lm_head`` if not tied) is
             shared with the draft, mirroring the reference impl.
+        model_type: Overrides the draft config's ``model_type`` so
+            :func:`load_model` dispatches to the right module.  The
+            checkpoints themselves declare ``qwen3`` (the backbone
+            family), not the DFlash variant.
 
     Returns:
-        The fully-initialised :class:`Model` with weights loaded,
+        The fully-initialised draft model with weights loaded,
         evaluated, and shared embeddings bound.  Config is
         accessible as ``draft.args``.
     """
@@ -466,7 +512,7 @@ def load_dflash_draft_model(
 
     draft, _ = load_model(
         dflash_path,
-        model_config={"model_type": "dflash"},
+        model_config={"model_type": model_type},
     )
 
     target_args = target_model.args
