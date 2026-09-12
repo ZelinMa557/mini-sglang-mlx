@@ -94,12 +94,16 @@ class ModelArgs(BaseModelArgs):
 
         Specifically:
         * The upstream checkpoint nests ``target_layer_ids`` and
-          ``mask_token_id`` under a ``dflash_config`` sub-object.
+          ``mask_token_id`` under a ``dflash_config`` sub-object, and
+          ``rope_theta`` under ``rope_parameters``.
         * ``layer_types`` is sometimes absent (default to all-full).
         * ``head_dim`` defaults to ``hidden_size // num_attention_heads``.
         """
         params = dict(params)
         sub = params.pop("dflash_config", {}) or {}
+        rope = params.get("rope_parameters")
+        if rope is not None:
+            params.setdefault("rope_theta", rope.get("rope_theta", cls.rope_theta))
         if "target_layer_ids" not in params and "target_layer_ids" in sub:
             params["target_layer_ids"] = tuple(sub["target_layer_ids"])
         if "mask_token_id" not in params and "mask_token_id" in sub:
