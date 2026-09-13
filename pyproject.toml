@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+# `mlx_serve` is a namespace package (no __init__.py), so the repo root has to
+# be importable as a path rather than discovered as an installed package.
+pythonpath = ["."]
+testpaths = ["mlx_serve/tests"]

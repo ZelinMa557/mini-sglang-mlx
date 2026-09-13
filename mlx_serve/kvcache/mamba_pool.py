@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, NamedTuple
+from typing import Iterable, List, NamedTuple
 
 import mlx.core as mx
 
@@ -104,6 +104,31 @@ class MambaStatePool:
     def available_size(self) -> int:
         return len(self._free_slots)
 
+    def check_ownership(self, tree_slots: Iterable[int]) -> None:
+        """Assert every slot is owned by the free list or by a cached prefix.
+
+        A slot has exactly one owner at a time: this pool's free list, a
+        radix-tree node holding a snapshot, or a live request.  This checks
+        the first two, so it is only meaningful when no request is running --
+        which is precisely when the scheduler calls it (see
+        ``Scheduler.run_when_idle``).  A slot owned by neither is leaked:
+        nothing will ever return it, and the pool shrinks by one forever.
+        """
+        owned = set(self._free_slots)
+        assert len(owned) == len(
+            self._free_slots
+        ), "free list contains duplicates"
+        for slot in tree_slots:
+            assert 1 <= slot <= self.num_slots, f"tree holds invalid slot {slot}"
+            assert slot not in owned, f"Slot {slot} is owned twice"
+            owned.add(slot)
+        leaked = set(range(1, self.num_slots + 1)) - owned
+        if leaked:
+            raise RuntimeError(
+                f"{len(leaked)} mamba slot(s) leaked: {sorted(leaked)} are "
+                "neither free nor held by a cached prefix"
+            )
+
     def alloc(self) -> int | None:
         if not self._free_slots:
             return None
@@ -129,13 +154,17 @@ class MambaStatePool:
 
     def free(self, slot: int) -> None:
         assert 1 <= slot <= self.num_slots, f"Invalid slot {slot}"
+        # A slot freed twice would sit in the free list twice and could be
+        # handed to two sequences at once, i.e. they would silently share one
+        # recurrent state.  There is no refcount to catch that later, so it
+        # has to fail here.
+        assert slot not in self._free_slots, f"Slot {slot} is already free"
         self._free_slots.append(slot)
 
     def free_many(self, slots: List[int]) -> None:
         """Return ``slots`` to the free pool in one Python call."""
-        if not slots:
-            return
-        self._free_slots.extend(slots)
+        for slot in slots:
+            self.free(slot)
 
     def copy(self, src: int, dst: int) -> None:
         """Copy all mamba state from *src* slot to *dst* slot."""

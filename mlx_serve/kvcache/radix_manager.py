@@ -178,6 +178,64 @@ class RadixCacheManager(BaseCacheManager):
 
         return node, prefix_len
 
+    def _release_node_state(self, node: RadixTreeNode) -> int:
+        """Hook: drop whatever the node holds besides its KV pages.
+
+        Subclasses that keep per-node state (mamba snapshots) free it here
+        and return how many of the eviction target's units that accounted
+        for.  The base tree holds nothing but pages.
+        """
+        del node
+        return 0
+
+    def _evict_leaves(
+        self, size: int = 0, num_slots: int = 0
+    ) -> Tuple[mx.array, int]:
+        """Evict least-recently-used leaves until both targets are met.
+
+        Callers pass whichever target they are short of and 0 for the other.
+        Leaves are taken in LRU order regardless of which target is being
+        chased: skipping slot-less leaves to reach a slot sooner would let a
+        colder node outlive a hotter one.
+
+        Returns the evicted page indices and the number of mamba slots freed.
+        """
+        leave_nodes = self._collect_leave_nodes_for_evict()
+        heapq.heapify(leave_nodes)
+        evicted_indices: List[mx.array] = []
+        evicted_size = 0
+        freed_slots = 0
+
+        while evicted_size < size or freed_slots < num_slots:
+            if not leave_nodes:
+                # The page target is backed by `size <= evictable_size`, so
+                # only a slot-chasing caller can run the tree dry -- and
+                # there it takes whatever was reclaimed.
+                assert evicted_size >= size, (
+                    f"Cannot evict enough cache, need {size}, "
+                    f"only {evicted_size} evicted"
+                )
+                break
+            node = heapq.heappop(leave_nodes)
+            assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
+            evicted_size += node.length
+            evicted_indices.append(node.value)
+            self.evictable_size -= node.length
+            freed_slots += self._release_node_state(node)
+
+            parent = node.parent
+            del parent.children[int(node._key[0].item())]
+            # NOTE: root is always protected, so won't be evicted
+            if parent.is_leaf() and parent.ref_count == 0:
+                heapq.heappush(leave_nodes, parent)
+
+        indices = (
+            mx.concatenate(evicted_indices)
+            if evicted_indices
+            else self.empty_tensor
+        )
+        return indices, freed_slots
+
     def evict(self, size: int) -> mx.array:
         if size == 0:
             return self.empty_tensor
@@ -185,27 +243,8 @@ class RadixCacheManager(BaseCacheManager):
             size <= self.evictable_size
         ), f"Cannot evict {size}, only {self.evictable_size} is evictable"
 
-        leave_nodes = self._collect_leave_nodes_for_evict()
-        heapq.heapify(leave_nodes)
-        evicted_indices: List[mx.array] = []
-        evicted_size = 0
-
-        while evicted_size < size:
-            assert (
-                leave_nodes
-            ), f"Cannot evict enough cache, need {size}, only {evicted_size} evicted"
-            node = heapq.heappop(leave_nodes)
-            assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
-            evicted_size += node.length
-            evicted_indices.append(node.value)
-            self.evictable_size -= node.length
-            parent = node.parent
-            del parent.children[int(node._key[0].item())]
-            # NOTE: root is always protected, so won't be evicted
-            if parent.is_leaf() and parent.ref_count == 0:
-                heapq.heappush(leave_nodes, parent)
-
-        return mx.concatenate(evicted_indices)
+        indices, _ = self._evict_leaves(size=size)
+        return indices
 
     def _collect_leave_nodes_for_evict(self) -> List[RadixTreeNode]:
         nodes: List[RadixTreeNode] = [self.root_node]
@@ -241,20 +280,34 @@ class RadixCacheManager(BaseCacheManager):
 
 @dataclass(frozen=True)
 class HybridCacheHandle(BaseCacheHandle):
-    """Cache handle for hybrid models: KV node + mamba state info."""
+    """Cache handle for hybrid models.
+
+    ``node`` is the deepest matched node that carries a mamba snapshot, so
+    ``node.mamba_slot`` is the state a request admitted on this handle must
+    fork before it can run.  ``cached_len > 0`` iff such a snapshot exists
+    (``cached_len == 0`` returns the root), which keeps the snapshot a single
+    source of truth instead of a copy that can go stale.
+
+    The request's own slot is *not* here: forking it mutates the pool, and a
+    query must not.  ``CacheManager.acquire_mamba_slot`` hands it out at
+    admission time, where a rejection can still give it back.
+    """
 
     node: RadixTreeNode
-    mamba_slot: int | None  # slot in MambaStatePool that was forked for this request
 
 
 class HybridRadixCacheManager(RadixCacheManager):
     """Radix cache that co-manages KV page indices and Mamba state slots.
 
-    For hybrid Mamba-Attention models, each radix tree leaf may carry a
-    ``mamba_slot`` pointing into a :class:`MambaStatePool`.  When a new
-    request matches a prefix, the manager finds the deepest node that has
-    both KV cache and a valid mamba slot, forks the mamba state, and returns
-    a :class:`HybridCacheHandle`.
+    For hybrid Mamba-Attention models, a radix node may carry a
+    ``mamba_slot`` holding the recurrent state at that node's end boundary.
+    A request that matches such a node forks the state (a copy -- the node's
+    own slot must stay intact for the next hit) and continues from there.
+
+    Because recurrent state cannot be split or trimmed, a request can only
+    reuse a prefix whose *end* has a snapshot: :meth:`_find_mamba_ancestor`
+    therefore walks *up* from the deepest KV match, and the length it reuses
+    is that ancestor's depth, even when more KV matched below it.
     """
 
     def __init__(self, mamba_pool: MambaStatePool, device: None = None) -> None:
@@ -266,22 +319,19 @@ class HybridRadixCacheManager(RadixCacheManager):
     def match_prefix(
         self, input_ids: mx.array
     ) -> Tuple[HybridCacheHandle, mx.array]:
+        """Match KV *and* report which mamba snapshot to fork.
+
+        Deliberately does not touch the mamba pool: forking is a mutation,
+        and the base contract says ``match_prefix`` must not modify the
+        cache.  Doing it here would also mean every caller that ends up
+        rejecting the request has to know it must give a slot back -- which
+        is exactly how slots used to leak.
+        """
         node, prefix_len = self._walk(input_ids)
 
         mamba_node, mamba_depth = self._find_mamba_ancestor(node, prefix_len)
-        effective_len = mamba_depth
-
-        forked_slot: int | None = None
-        if mamba_node.mamba_slot is not None and effective_len > 0:
-            forked_slot = self.mamba_pool.alloc()
-            if forked_slot is not None:
-                self.mamba_pool.copy(mamba_node.mamba_slot, forked_slot)
-            else:
-                effective_len = 0
-                mamba_node = self.root_node
-
-        if effective_len == 0:
-            return HybridCacheHandle(0, self.root_node, forked_slot), self.empty_tensor
+        if mamba_node.mamba_slot is None or mamba_depth == 0:
+            return HybridCacheHandle(0, self.root_node), self.empty_tensor
 
         value_list: List[mx.array] = []
         walk = mamba_node
@@ -290,7 +340,7 @@ class HybridRadixCacheManager(RadixCacheManager):
             walk = walk.parent
         value_list.reverse()
         return (
-            HybridCacheHandle(effective_len, mamba_node, forked_slot),
+            HybridCacheHandle(mamba_depth, mamba_node),
             mx.concatenate(value_list),
         )
 
@@ -326,6 +376,15 @@ class HybridRadixCacheManager(RadixCacheManager):
             new_node.mamba_slot = mamba_slot
             self.evictable_size += new_node.length
         else:
+            # The whole sequence is already cached.  Adopting the slot here
+            # is fine even if the node is locked by a live request: that
+            # request forked its own copy at admission and never reads this
+            # snapshot again.  The root is the exception -- eviction only
+            # ever removes leaves, so a snapshot there could never be
+            # reclaimed.
+            assert not (node.is_root() and mamba_slot is not None), (
+                "cannot store a snapshot on the root"
+            )
             if node.mamba_slot is None and mamba_slot is not None:
                 node.mamba_slot = mamba_slot
             elif mamba_slot is not None:
@@ -334,35 +393,60 @@ class HybridRadixCacheManager(RadixCacheManager):
 
     # ── eviction ─────────────────────────────────────────────────────────
 
-    def evict(self, size: int) -> mx.array:
-        if size == 0:
-            return self.empty_tensor
-        assert (
-            size <= self.evictable_size
-        ), f"Cannot evict {size}, only {self.evictable_size} is evictable"
+    def _release_node_state(self, node: RadixTreeNode) -> int:
+        if node.mamba_slot is None:
+            return 0
+        self.mamba_pool.free(node.mamba_slot)
+        node.mamba_slot = None
+        return 1
 
-        leave_nodes = self._collect_leave_nodes_for_evict()
-        heapq.heapify(leave_nodes)
-        evicted_indices: List[mx.array] = []
-        evicted_size = 0
+    def evict_for_mamba(self, count: int) -> Tuple[mx.array, int]:
+        """Evict LRU prefixes until *count* mamba slots come back.
 
-        while evicted_size < size:
-            assert (
-                leave_nodes
-            ), f"Cannot evict enough cache, need {size}, only {evicted_size} evicted"
-            node = heapq.heappop(leave_nodes)
-            assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
-            evicted_size += node.length
-            evicted_indices.append(node.value)
-            self.evictable_size -= node.length
+        The mamba pool runs dry independently of the KV budget, so without
+        this the pool can reach empty while the tree still holds plenty of
+        reclaimable snapshots -- and nothing would ever trigger a reclaim.
+        Treating "pool dry" as cache pressure makes the pool's capacity an
+        upper bound on how many snapshots the tree can hold, which is
+        exactly what keeps it from draining permanently.
 
+        Returns the evicted page indices and how many slots were freed; the
+        latter is short of *count* once there is nothing left to evict.
+        """
+        return self._evict_leaves(num_slots=count)
+
+    def collect_mamba_slots(self) -> List[int]:
+        """Every mamba slot currently held by a cached prefix."""
+        slots: List[int] = []
+        stack: List[RadixTreeNode] = [self.root_node]
+        while stack:
+            node = stack.pop()
             if node.mamba_slot is not None:
-                self.mamba_pool.free(node.mamba_slot)
-                node.mamba_slot = None
+                slots.append(node.mamba_slot)
+            stack.extend(node.children.values())
+        return slots
 
-            parent = node.parent
-            del parent.children[int(node._key[0].item())]
-            if parent.is_leaf() and parent.ref_count == 0:
-                heapq.heappush(leave_nodes, parent)
+    def coldest_snapshot_node(
+        self, exclude: RadixTreeNode | None = None
+    ) -> RadixTreeNode | None:
+        """The least-recently-used node holding a mamba snapshot.
 
-        return mx.concatenate(evicted_indices)
+        ``exclude`` skips one node -- the one a request is about to fork
+        from, which must keep its snapshot until the copy is done.  Its
+        children are still searched.
+        """
+        best: RadixTreeNode | None = None
+        stack: List[RadixTreeNode] = [self.root_node]
+        while stack:
+            node = stack.pop()
+            if node.mamba_slot is not None and node is not exclude:
+                if best is None or node.timestamp < best.timestamp:
+                    best = node
+            stack.extend(node.children.values())
+        return best
+
+    def check_integrity(self) -> None:
+        super().check_integrity()
+        # Only meaningful while no request runs: a live request's slot is
+        # owned by neither the free list nor the tree, and would look leaked.
+        self.mamba_pool.check_ownership(self.collect_mamba_slots())
