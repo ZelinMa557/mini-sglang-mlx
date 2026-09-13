@@ -36,6 +36,38 @@ project is really about.
 * **Streaming reasoning and tool calls** — `reasoning_content` and
   `tool_calls`, parsed with transformers' declarative response parsing.
 
+## Roadmap
+
+1. **W4A8 quantization with matching quantized kernels.** Weight-only 4-bit
+   quantization is the reason `M` saturates at 2 — the weights are already so
+   compressed that there is nothing left to hide the arithmetic behind. Going
+   to 4-bit weights / 8-bit activations raises arithmetic intensity at small
+   `M`, which is what speculative decoding needs to actually pay off, and is
+   targeted at a **~50% speedup on long-context prefill**.
+2. **Continue improving the paged attention kernel.** The current kernels are
+   a first working version; closing the 0.75× gap against MLX's built-in
+   attention is an ongoing effort.
+3. **Prepare for the Qwen4 architecture.** The model layer is deliberately
+   small and registry-driven, and the next Qwen generation is expected to
+   need structural changes that are cheaper to make now than later.
+
+## Supported models
+
+| Family | Resolves to | Notes |
+| --- | --- | --- |
+| Qwen3 | `models/qwen3.py` | dense |
+| Qwen3-MoE | `models/qwen3_moe.py` | |
+| Qwen3.5 | `models/qwen3_5.py` | GDN + attention hybrid |
+| Qwen3.5-MoE | `models/qwen3_5_moe.py` | sparse MoE on the Qwen3.5 hybrid stack |
+| Qwen3.8 | `models/qwen3_5.py` | GDN + attention hybrid |
+
+The draft models used by speculative decoding (`models/dflash.py`,
+`models/dflash2.py`) are loaded through the same registry.
+
+Everything except Qwen3.8 and Qwen3.5-MoE has been run end to end here;
+Qwen3.5-MoE is registered and resolves correctly but has not been exercised
+against a real checkpoint.
+
 ## Status
 
 **This project is early.** It runs, it serves real requests, and the numbers
@@ -60,68 +92,13 @@ built-in attention path is faster.
 
 ### 2. Speculative decoding does not reliably turn accept length into speed
 
-Verifying `W = K + 1` draft tokens is a single forward with `M = B × W`. MLX's
-`quantized_matmul` is already at its bandwidth ceiling by `M = 2`; from
-`M = 3` upward each additional verified token costs a **fixed** ~0.125 ms per
-projection rather than amortising. Measured on the gate projection
-(`K=5120, N=17408`, 4-bit, group size 64):
-
-| M | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| ms | 0.602 | 0.590 | 0.646 | 0.757 | 0.883 | 1.016 | 1.139 | 1.268 |
-| effective GB/s | 83.3 | 84.9 | 77.7 | 66.2 | 56.8 | 49.4 | 44.0 | 39.5 |
-
-Two regimes, with the crossover between `M = 2` and `M = 3`: up to `M = 2` the
-projection is purely bandwidth-bound and a second token is **free**, and from
-`M = 3` on it pays a fixed ~0.125 ms per additional token instead of
-amortising.
-
-So the marginal cost of a longer draft is nearly free, but the *baseline* cost
-of a verify pass is ~2× a plain decode step regardless of how many tokens are
-accepted. Speculative decoding therefore only wins once the draft reliably
-lands more than ~2–3 tokens per step. On the targets we have tested DFlash2
-does not consistently clear that bar, so the accept length is real but the
-wall-clock win is not.
-
-Two consequences worth stating plainly: **shrinking `K` is the wrong fix**
-(draft tokens are nearly free — they are not what costs you), and so is
-fusing or rebalancing projections (the bottleneck is `M`, not `N`). What does
-help is batching: the per-token cost of the same projection falls from
-0.602 ms at `M = 1` to 0.159 ms at `M = 8`, because one pass over the weights
-serves eight tokens instead of one.
-
-## Roadmap
-
-1. **W4A8 quantization with matching quantized kernels.** Weight-only 4-bit
-   quantization is the reason `M` saturates at 2 — the weights are already so
-   compressed that there is nothing left to hide the arithmetic behind. Going
-   to 4-bit weights / 8-bit activations raises arithmetic intensity at small
-   `M`, which is what speculative decoding needs to actually pay off, and is
-   targeted at a **~50% speedup on long-context prefill**.
-2. **Continue improving the paged attention kernel.** The current kernels are
-   a first working version; closing the 0.75× gap against MLX's built-in
-   attention is an ongoing effort.
-3. **Prepare for the Qwen4 architecture.** The model layer is deliberately
-   small and registry-driven, and the next Qwen generation is expected to
-   need structural changes that are cheaper to make now than later.
-
-## Supported models
-
-| Family | Resolves to | Notes |
-| --- | --- | --- |
-| Qwen3 | `models/qwen3.py` | dense |
-| Qwen3-MoE | `models/qwen3_moe.py` | |
-| Qwen3.5 | `models/qwen3_5.py` | GDN + attention hybrid |
-| Qwen3.8 | `models/qwen3_5.py` | GDN + attention hybrid |
-
-The draft models used by speculative decoding (`models/dflash.py`,
-`models/dflash2.py`) are loaded through the same registry.
-
-> There is also a `models/qwen3_5_moe.py` (sparse MoE on top of the Qwen3.5
-> hybrid stack), but it is currently **unreachable**: `MODEL_REMAPPING` in
-> `models/__init__.py` maps `model_type: "qwen3_5_moe"` to `qwen3_5`, so such a
-> checkpoint is loaded by the *dense* module and the sparse one is shadowed.
-> Remove that mapping entry to make it reachable again.
+Target verify pushes `K + 1` tokens through a single forward with
+`M = B × (K + 1)`, and MLX's built-in `quantized_matmul` performs poorly in
+exactly that small-`M` regime. A verify pass therefore costs roughly **2× a
+plain decode step** regardless of how many tokens are accepted, so speculative
+decoding only wins once the draft reliably lands more than ~2–3 tokens per
+step. DFlash2 does not consistently clear that bar on the targets we have
+tested — the accept length is real, the wall-clock win is not.
 
 ## Installation
 
@@ -261,7 +238,7 @@ mini_sglang_mlx/            Python package (namespace package, no __init__.py)
 ├── scheduler/              Scheduler loop, prefill + decode scheduling, cache manager
 ├── kvcache/                Paged KV pool, radix-tree prefix cache, mamba state pool
 ├── attention/              Attention backends (paged MHA, GDN recurrence)
-├── models/                 Model registry — qwen3 / qwen3_moe / qwen3_5 / dflash2
+├── models/                 Model registry — qwen3 / qwen3_moe / qwen3_5 / qwen3_5_moe / dflash2
 ├── layers/                 Metal-backed layers (GDN, rotary, switch linear)
 ├── server/                 FastAPI app, CLI args, process launch
 ├── tokenizer/              Tokenizer + detokenizer workers

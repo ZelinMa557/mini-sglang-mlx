@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 MODEL_REMAPPING = {
     "mistral": "llama",
-    "qwen3_5_moe": "qwen3_5",
 }
 
 
