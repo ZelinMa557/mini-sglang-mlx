@@ -191,7 +191,8 @@ def parse_args(args: List[str]) -> ServerArgs:
              "auto-computed as max_running_req * (2 + spec_extra).  "
              "Exposed for hybrid models where the default heuristic "
              "may under-allocate; only meaningful for Qwen3.5-style "
-             "GDN-hybrid targets.",
+             "GDN-hybrid targets.  If set, must exceed max_running_req "
+             "(one slot per in-flight req, plus one for a cached prefix).",
     )
 
     # ── Speculative decoding (unified) ────────────────────────────

@@ -52,7 +52,8 @@ class EngineConfig:
     # scratch).  Useful for hybrid models (Qwen3.5) where the
     # default heuristic may over- or under-allocate; this knob is
     # exposed for didactic purposes (the project is meant to be a
-    # teaching codebase).
+    # teaching codebase).  Must exceed ``max_running_req``: see
+    # ``__post_init__``.
     num_mamba_slots: int | None = None
 
     def __post_init__(self) -> None:
@@ -71,11 +72,20 @@ class EngineConfig:
                     f"spec_algo={self.spec_algo!r} requires "
                     f"num_draft_tokens >= 1, got {self.num_draft_tokens}"
                 )
-        if self.num_mamba_slots is not None and self.num_mamba_slots < self.max_running_req:
+        if (
+            self.num_mamba_slots is not None
+            and self.num_mamba_slots <= self.max_running_req
+        ):
+            # Every in-flight req needs its own main slot, and one more has
+            # to survive alongside them: a running req can only reuse a
+            # cached prefix if a snapshot is still there to fork.  At
+            # exactly one slot per req the pool is always fully consumed by
+            # live reqs, so mamba state would never be reused at all.
             raise ValueError(
-                f"num_mamba_slots ({self.num_mamba_slots}) must be >= "
-                f"max_running_req ({self.max_running_req}) so every "
-                "in-flight req has at least its own main slot."
+                f"num_mamba_slots ({self.num_mamba_slots}) must be > "
+                f"max_running_req ({self.max_running_req}): each in-flight "
+                "req needs a slot, plus at least one for a cached prefix. "
+                "Leave it unset to use the default sizing."
             )
 
     @cached_property

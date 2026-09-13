@@ -222,6 +222,16 @@ class SpecEngine(Engine, ABC):
             assert self.mamba_pool is not None
             allocated = self.mamba_pool.alloc_many(B)
             if allocated is None:
+                # Verify needs one scratch slot per req on top of the main
+                # slots. A dry pool is cache pressure, not a fatal error:
+                # reclaim snapshots from the coldest prefixes and retry.
+                from mlx_serve.scheduler.cache import HybridCacheManager
+
+                cache_manager = self.cache_manager
+                assert isinstance(cache_manager, HybridCacheManager)
+                cache_manager.evict_for_mamba(B - self.mamba_pool.available_size)
+                allocated = self.mamba_pool.alloc_many(B)
+            if allocated is None:
                 raise RuntimeError(
                     f"Out of mamba scratch slots: needed {B}, "
                     f"have {self.mamba_pool.available_size}"
