@@ -234,9 +234,11 @@ class GatedDeltaNet(nn.Module):
         conv_out = self.conv1d(conv_input)
         conv_out = conv_out.reshape(batch_size * num_draft, self.conv_dim)
 
-        # 4. Save per-step conv windows in a batch-aware loop over draft steps.
-        for j in range(num_draft):
-            window_buf[scratch_slots, j] = conv_input[:, j + 1 : j + 1 + state_len, :]
+        # 4. Save per-step conv windows: row [b, j] is the window after
+        #    ``j + 1`` tokens, i.e. ``conv_input[:, j+1 : j+1+state_len]``.
+        #    One gather over the whole window instead of a per-step loop.
+        offsets = mx.arange(num_draft)[:, None] + mx.arange(state_len)[None, :] + 1
+        window_buf[scratch_slots] = mx.take(conv_input, offsets, axis=1)
 
         return nn.silu(conv_out)
 
