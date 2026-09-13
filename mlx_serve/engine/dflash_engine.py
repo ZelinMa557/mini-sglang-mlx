@@ -57,14 +57,10 @@ Per-iter page lifecycle (per req ``i``, ``j = num_drafts_accepted``):
 
 Limitations (intentional first cut):
     * Greedy verification only (temperature 0).
-    * No chunked prefill.
-    * **Block attention kernel pending.**  The draft layers call
-      :meth:`AttnBackend.forward` with new
-      ``is_cross_attention`` / ``sliding_window_size`` kwargs that
-      ``mlx_serve_kernel.paged_prefill_attention`` does not yet
-      honour.  See ``docs/dflash_kernel_requirements.md`` for the
-      required contract — once the kernel update lands this engine
-      will run as-is.
+    * No chunked prefill: :meth:`DflashEngine._run_prefill` raises on
+      a :class:`~mlx_serve.scheduler.prefill.ChunkedReq`, so a prompt
+      whose uncached part exceeds the prefill budget cannot be
+      served.
 """
 
 from __future__ import annotations
@@ -101,10 +97,13 @@ class DflashEngine(SpecEngine):
     layout: ``page_table``, page IDs (and consequently the prefix
     cache).
 
-    The block-attention kernel is not yet implemented (see module
-    docstring); this engine is otherwise complete and will run end-
-    to-end once ``paged_prefill_attention`` learns to honour
-    ``is_cross_attention`` / ``sliding_window_size``.
+    The draft layers need block attention: bidirectional inside the
+    ``K + 1``-token proposal block, sliding-window over the cached
+    context behind it.  Both come from
+    ``mlx_serve_kernel.paged_prefill_attention`` via the
+    ``is_cross_attention`` / ``sliding_window_size`` kwargs, so a
+    standard :class:`~mlx_serve.attention.backend.AttnBackend` serves
+    the draft as-is.
     """
 
     #: Registry key in :data:`mlx_serve.engine.SPEC_ALGOS`, and the
