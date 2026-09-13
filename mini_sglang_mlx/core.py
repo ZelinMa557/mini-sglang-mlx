@@ -1,0 +1,201 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import TYPE_CHECKING, List
+
+import mlx.core as mx
+
+if TYPE_CHECKING:
+    from mini_sglang_mlx.attention import AttnBackend, BaseAttnMetadata, GDNBackend
+    from mini_sglang_mlx.kvcache import BaseCacheHandle
+    from mini_sglang_mlx.kvcache.mamba_pool import MambaStatePool
+
+
+class BatchPhase(str, Enum):
+    PREFILL = "prefill"
+    DECODE = "decode"
+    TARGET_VERIFY = "target_verify"
+
+
+@dataclass
+class SamplingParams:
+    temperature: float = 0.0
+    top_k: int = -1
+    top_p: float = 1.0
+    ignore_eos: bool = False
+    max_tokens: int = 1024
+
+    @property
+    def is_greedy(self) -> bool:
+        return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
+
+
+@dataclass(eq=False)
+class Req:
+    input_ids: mx.array  # 1D array (unified memory)
+    table_idx: int
+    cached_len: int
+    output_len: int
+    uid: int
+    sampling_params: SamplingParams
+    cache_handle: BaseCacheHandle
+    mamba_slot: int | None = None  # slot in MambaStatePool for hybrid models
+
+    # ── Speculative-decoding state (used by SpecEngine subclasses) ────
+    # ``pending_token`` (all spec methods): the next-token that has
+    # been sampled by target but is NOT yet committed to the target's
+    # KV cache; it sits at ``input_ids[cached_len]`` and will be the
+    # first verify position next iter.
+    pending_token: mx.array | None = None  # shape [1]
+    # EAGLE-style only:
+    # ``pending_draft_token`` / ``pending_draft_hidden`` carry the
+    # FIRST draft prediction for the upcoming iter (from prev iter's
+    # bonus calibration or the draft prefill) and the draft model's
+    # last hidden state at that draft position (used as
+    # ``target_hidden_states`` proxy for the first regular draft step).
+    pending_draft_token: mx.array | None = None  # shape [1]
+    pending_draft_hidden: mx.array | None = None  # shape [hidden_size]
+
+    def __post_init__(self) -> None:
+        self.device_len = len(self.input_ids)
+        self.max_device_len = len(self.input_ids) + self.output_len
+        assert 0 <= self.cached_len < self.device_len <= self.max_device_len
+
+    @property
+    def remain_len(self) -> int:
+        return self.max_device_len - self.device_len
+
+    @property
+    def extend_len(self) -> int:
+        return self.device_len - self.cached_len
+
+    def complete_one(self) -> None:
+        self.cached_len = self.device_len
+        self.device_len += 1
+
+    def complete_many(self, n: int) -> None:
+        """Same semantics as :meth:`complete_one` but commits ``n`` tokens.
+
+        After the call, ``cached_len`` is bumped by ``n`` and ``device_len``
+        is set to ``cached_len + 1`` so that exactly one pending/placeholder
+        slot is reserved for the next iter. Used by speculative decoders
+        where a single forward pass commits a variable number of tokens.
+        """
+        self.cached_len += n
+        self.device_len = self.cached_len + 1
+
+    def append_host(self, next_token: mx.array) -> None:
+        self.input_ids = mx.concatenate([self.input_ids, next_token])
+
+    def can_decode(self) -> bool:
+        return self.remain_len > 0
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self)}(table_idx={self.table_idx}, "
+            f"cached_len={self.cached_len}, device_len={self.device_len}, "
+            f"max_device_len={self.max_device_len})"
+        )
+
+
+@dataclass
+class Batch:
+    reqs: List[Req]
+    phase: BatchPhase
+    # these fields should be set by scheduler
+    input_ids: mx.array = field(init=False)
+    out_loc: mx.array = field(init=False)
+    padded_reqs: List[Req] = field(init=False)  # may contain some dummy reqs for padding
+    # this field should be set by attention backend
+    attn_metadata: BaseAttnMetadata = field(init=False)
+    # [B] int32 — per-req main mamba slot (prefill / decode / verify).
+    mamba_slot_ids: mx.array | None = field(default=None, init=False, repr=False)
+    # [B] int32 — per-req scratch mamba slot used by replay-style
+    # target verify (copy of the main slot before the verify window).
+    mamba_scratch_slots: mx.array | None = field(default=None, init=False, repr=False)
+    # [B + 1] int32 — uniform CSR indptr over the B * W verify window
+    # (entry ``b`` = ``b * W``); the replay kernel walks
+    # ``[indptr[b], indptr[b + 1])`` per req.
+    mamba_verify_indptr: mx.array | None = field(default=None, init=False, repr=False)
+    # Per-linear-layer (q, k, v, g, beta) captured during target
+    # verify, keyed by linear_layer_idx.  Kept alive so the commit
+    # replay can gather each req's accepted prefix without recomputing
+    # the model projections.  Cleared once the commit finishes.
+    gdn_verify_captured: dict | None = field(default=None, init=False, repr=False)
+    mamba_prefill_indptr: mx.array | None = field(default=None, init=False, repr=False)
+
+    @property
+    def is_prefill(self) -> bool:
+        return self.phase == BatchPhase.PREFILL
+
+    @property
+    def is_decode(self) -> bool:
+        return self.phase == BatchPhase.DECODE
+
+    @property
+    def is_target_verify(self) -> bool:
+        return self.phase == BatchPhase.TARGET_VERIFY
+
+    @property
+    def size(self) -> int:
+        return len(self.reqs)
+
+    @property
+    def padded_size(self) -> int:
+        return len(self.padded_reqs)
+
+
+@dataclass
+class Context:
+    page_size: int
+    attn_backend: AttnBackend
+    mamba_pool: MambaStatePool | None = None
+    gdn_backend: GDNBackend | None = None
+    _batch: Batch | None = field(default=None, init=False)
+
+    @property
+    def batch(self) -> Batch:
+        assert self._batch is not None, "No active batch in context"
+        return self._batch
+
+    @contextmanager
+    def forward_batch(self, batch: Batch):
+        assert self._batch is None, "Nested forward_batch is not allowed"
+        try:
+            self._batch = batch
+            yield
+        finally:
+            self._batch = None
+
+
+_GLOBAL_CTX: Context | None = None
+
+
+def set_global_ctx(ctx: Context):
+    global _GLOBAL_CTX
+    assert _GLOBAL_CTX is None, "Global context is already set"
+    _GLOBAL_CTX = ctx
+
+
+def get_global_ctx() -> Context:
+    assert _GLOBAL_CTX is not None, "Global context is not set"
+    return _GLOBAL_CTX
+
+
+@contextmanager
+def use_ctx(ctx: Context):
+    """Temporarily swap the process-global context.
+
+    Used by speculative-decoding engines that own a second ``Context``
+    for the draft model (different ``AttnBackend`` / KV cache) but share
+    the target model's layers (which read ``get_global_ctx()``).
+    """
+    global _GLOBAL_CTX
+    old = _GLOBAL_CTX
+    _GLOBAL_CTX = ctx
+    try:
+        yield
+    finally:
+        _GLOBAL_CTX = old

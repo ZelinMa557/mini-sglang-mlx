@@ -30,10 +30,10 @@ compile_commands.json
 *.log
 *.tmp
 
-# mlx-serve-kernel local compile/debug artifacts
-mlx-serve-kernel/build/
-mlx-serve-kernel/mlx_serve_kernel.egg-info/
-mlx-serve-kernel/mlx_serve_kernel/__pycache__/
-mlx-serve-kernel/mlx_serve_kernel/_ext*.so
-mlx-serve-kernel/mlx_serve_kernel/*.dylib
-mlx-serve-kernel/mlx_serve_kernel/*.metallib
+# mini-sglang-mlx-kernel local compile/debug artifacts
+mini-sglang-mlx-kernel/build/
+mini-sglang-mlx-kernel/mini_sglang_mlx_kernel.egg-info/
+mini-sglang-mlx-kernel/mini_sglang_mlx_kernel/__pycache__/
+mini-sglang-mlx-kernel/mini_sglang_mlx_kernel/_ext*.so
+mini-sglang-mlx-kernel/mini_sglang_mlx_kernel/*.dylib
+mini-sglang-mlx-kernel/mini_sglang_mlx_kernel/*.metallib
