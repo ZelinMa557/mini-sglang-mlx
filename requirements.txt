@@ -1,0 +1,43 @@
+# mini-sglang-mlx runtime dependencies.
+#
+# This file does NOT include the Metal/C++ kernel extension.  That extension
+# is not on PyPI and has to be built from source first -- see the
+# "Installation" section of README.md.
+#
+#     pip install -r requirements.txt
+#     cd mini-sglang-mlx-kernel && pip install -e . --no-build-isolation
+
+# --- Core compute -----------------------------------------------------------
+# mlx >= 0.31.2 is what the kernel extension is built against; older releases
+# are missing the Metal APIs the runtime JIT path uses.
+mlx>=0.31.2
+
+# --- Model loading / tokenization -------------------------------------------
+# >= 5.16.1 for transformers.utils.chat_parsing, which backs streaming
+# reasoning and tool-call parsing.  Earlier 5.x releases do not ship it.
+transformers>=5.16.1
+huggingface_hub
+safetensors
+
+# --- Serving frontend -------------------------------------------------------
+fastapi
+starlette
+uvicorn
+pydantic
+
+# --- Internode / interprocess transport -------------------------------------
+pyzmq
+msgpack
+
+# --- Numerics ---------------------------------------------------------------
+numpy
+
+# --- Optional ---------------------------------------------------------------
+# Only needed for --use-modelscope (resolving checkpoints from ModelScope
+# instead of HuggingFace).  Imported lazily, so it is safe to omit.
+# modelscope
+
+# --- Development ------------------------------------------------------------
+# pytest
+# nanobind        # required to build the kernel extension
+# cmake>=3.25     # required to build the kernel extension
