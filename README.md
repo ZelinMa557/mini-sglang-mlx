@@ -1,6 +1,6 @@
-# mlx-serve
+# mini-sglang-mlx
 
-mlx-serve is a (at current stage, will be a) high performance LLM inference engine for Mac GPUs.
+mini-sglang-mlx is a (at current stage, will be a) high performance LLM inference engine for Mac GPUs.
 
 It support the following features:
 
@@ -22,7 +22,7 @@ Requires `transformers>=5.16.1` (response parsing lives in
 ## Reasoning and tool calls
 
 Reasoning and tool calls are parsed with transformers' declarative response
-parsing. Templates are resolved per model in `mlx_serve/parser/response_templates.py`:
+parsing. Templates are resolved per model in `mini_sglang_mlx/parser/response_templates.py`:
 a `response_template` key in the checkpoint's `tokenizer_config.json` wins, then
 the registry lookup by `model_type`, then no parsing at all (raw passthrough).
 

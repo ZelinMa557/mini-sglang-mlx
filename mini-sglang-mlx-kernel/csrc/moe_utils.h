@@ -1,0 +1,58 @@
+#pragma once
+
+#include "mlx/ops.h"
+#include "mlx/primitives.h"
+#include <assert.h>
+namespace mx = mlx::core;
+
+namespace mini_sglang_mlx {
+
+mx::array moe_sum_reduce(
+    const mx::array& y,
+    const mx::array& scores,
+    mx::StreamOrDevice s = {});
+
+mx::array moe_sum_reduce_with_reorder(
+    const mx::array& y,
+    const mx::array& scores,
+    const mx::array& inv_order,
+    mx::StreamOrDevice s = {});
+
+class MoeSumReduce : public mx::Primitive {
+ public:
+  explicit MoeSumReduce(mx::Stream stream)
+      : mx::Primitive(stream){};
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override { assert(false);}
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  /** The name of primitive. */
+  const char* name() const override {
+    return "MoeSumReduce";
+  }
+};
+
+class MoeSumReduceWithReorder : public mx::Primitive {
+ public:
+  explicit MoeSumReduceWithReorder(mx::Stream stream)
+      : mx::Primitive(stream){};
+
+  void eval_cpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override { assert(false);}
+  void eval_gpu(
+      const std::vector<mx::array>& inputs,
+      std::vector<mx::array>& outputs) override;
+
+  /** The name of primitive. */
+  const char* name() const override {
+    return "MoeSumReduceWithReorder";
+  }
+};
+
+} // namespace mini_sglang_mlx
+
